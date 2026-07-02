@@ -24,6 +24,8 @@
 | 飞书会话 | 运行时上下文 | - | - | 从来源消息上下文提取，交互式命令结果仅回到来源会话 |
 | Telegram 会话 | 运行时上下文 | - | - | 从来源消息上下文提取，交互式命令结果仅回到来源会话 |
 
+Discord 长报告发送复用现有分片链路：单条 `content` 运行时不会超过 Discord 2000 字符限制，Webhook 与 Bot API 都会逐片发送并在片与片之间短暂等待；遇到 429 时按 Discord 返回的 `retry_after` 或 `Retry-After` 做有限重试，避免中途限流后只收到前半段报告。
+
 ## Minimal / Advanced 分层
 
 - Minimal key：足以启用一个通知渠道的最小配置。
@@ -47,7 +49,7 @@
 - `model_used` 只在报告渲染末尾展示，不参与 provider/model/base_url 的 runtime 选择、保存、清理或迁移。若某次 CI 扫描到“provider/API 兼容迁移”类关键词，命中范围应优先回归到测试夹具中的 `model_used` 示例与报告快照 fixture（`tests/fixtures/notification_reports/*.md`），以及 `src/notification.py` 对 `report_show_llm_model` 的仅展示开关逻辑。
 - `REPORT_SHOW_LLM_MODEL` 与 `report_renderer_enabled` 均为展示/降级策略开关：关闭仅影响报告可见结构，不会触发配置迁移或运行时参数回退；回退方式为恢复 `true`（或移除该项）或恢复默认配置。
 
-关联板块渲染保持报告正文生成阶段处理：当板块表现数据不可用且所有板块类型均缺失时，只输出一行板块名称；有板块类型或板块涨跌榜信号时继续使用表格。
+关联板块渲染保持报告正文生成阶段处理：没有行业/概念涨跌榜信号时，推送报告沿用原有单行样式，例如 `通信线缆及配套 / 通信设备 / 通信 / 江苏板块 / 科技风格`，不额外展示“类型”列。只有命中 `fundamental_context.boards.data` / `sector_rankings` 或 `fundamental_context.concept_boards.data` / `concept_rankings` 的领涨/领跌信号时，才使用表格展示“板块 / 类型 / 板块表现 / 板块涨跌幅”，其中“类型”列用于标明“行业板块”或“概念板块”。该逻辑仅影响报告展示，不改变 provider/model/Base URL、LiteLLM 路由、模型保存、迁移或清理逻辑。
 
 ## GitHub Actions 映射
 
@@ -140,6 +142,10 @@ Web 设置页的“通知渠道”分类提供单渠道测试入口。测试会�
 - `$title_json`：JSON 转义后的通知标题，推荐默认使用。
 - `$content` / `$title`：原始字符串，不做 JSON 转义。正文含双引号、反斜杠或换行时可能导致 JSON 无效并触发 fallback。
 
+Docker Compose 部署中，Web 设置页保存该模板到 `.env` 时会自动把应用占位符写成 `$$content_json`、`$$title_json`、`$$content`、`$$title`，避免 Compose 将其当作宿主环境变量展开为空；应用运行时会还原为单个 `$` 占位符。若手工编辑 Docker 使用的 `.env`，也请按 `$$content_json` 形式保存。
+
+该特性仅影响通知体渲染，不涉及 LLM `provider` / `model` / `base URL` / LiteLLM 路由的保存、迁移或清理语义；若某次结构化扫描出现 provider/API 兼容语义命中，命中范围应退回到本文件的报告模型展示与通知配置分离说明，而不是本次 webhook 修复链路本身。
+
 通用 webhook 示例：
 
 ```env
@@ -221,6 +227,10 @@ P5 强化聚合报告通知路径的失败边界：`_send_notifications()` 在 r
 - 邮件按 receiver group 单独隔离；某个收件人分组失败时，后续分组仍会继续发送。
 - 任一静态渠道发送成功时，P4 降噪 reservation 会写入正式记录；全部静态渠道失败或抛异常时，会释放 reservation。
 - `send_to_context()` 仍独立于静态渠道 route 和降噪记录，用于回复触发任务的 Bot 会话上下文。
+
+#1390 P6 的决策信号摘要沿用同一失败隔离边界：分析报告通知和告警通知只追加低敏 `decision_signal_summary` 摘要（动作、周期、理由、观察条件、风险和来源报告），不会输出 signal `metadata`、`evidence`、raw diagnostics 或 webhook/token。告警通知发送失败只记录通知尝试或 dispatch fallback，不回滚已经写入的 trigger 或 DecisionSignal。
+
+DecisionSignal 通知摘要字段、敏感信息边界、迁移与回滚说明见 [DecisionSignal 决策信号专题](decision-signals.md)。
 
 ## 通知降噪机制
 
