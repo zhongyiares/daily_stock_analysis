@@ -21,6 +21,7 @@ import copy
 import json
 import logging
 import re
+import unicodedata
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +39,7 @@ from api.v1.schemas.analysis import (
     BatchTaskAcceptedResponse,
     BatchTaskAcceptedItem,
     BatchDuplicateTaskItem,
+    RejectedTaskItem,
     TaskStatus,
     TaskInfo,
     TaskListResponse,
@@ -75,6 +77,7 @@ from src.market_phase_summary import (
     rebuild_market_phase_summary_for_stock_code,
 )
 from src.services.stock_code_utils import is_code_like, resolve_index_stock_code_for_analysis
+from src.services.stock_list_parser import ParseStatus, parse_analysis_target
 from src.report_language import get_localized_stock_name, normalize_report_language
 from src.schemas.decision_action import build_action_fields
 from src.services.name_to_code_resolver import resolve_name_to_code
@@ -83,8 +86,15 @@ from src.services.task_queue import (
     DuplicateTaskError,
     TaskStatus as TaskStatusEnum,
 )
+from src.services.analysis_service import asset_type_from_canonical_code
+from src.services.report_builder_service import (
+    build_analysis_report_payload,
+    load_sync_fundamental_sources,
+    stringify_report_strategy_value,
+)
 from src.services.run_diagnostics import build_run_diagnostic_summary
 from src.services.run_flow import build_task_run_flow_snapshot
+from src.services.empty_news import empty_news_disclosure_from_stored
 from src.utils.data_processing import (
     normalize_model_used,
     parse_json_field,
@@ -109,6 +119,32 @@ def _get_task_trace_id(task: Any) -> Optional[str]:
     task_id = getattr(task, "task_id", None)
     if isinstance(task_id, str) and task_id.strip():
         return task_id
+    return None
+
+
+def _task_asset_type(task: Any) -> Optional[str]:
+    """Return the task's optional asset type only when it is a real literal.
+
+    The Pydantic literal domain (``stock``/``index``) is the only allowed set:
+    real in-domain strings pass through verbatim. Legacy mock/proxy tasks whose
+    ``getattr`` yields a ``MagicMock`` child, and missing values, degrade to
+    ``None`` so schema defaults keep legacy responses unchanged. Genuine
+    out-of-domain strings are logged and degraded instead of widening the enum
+    or silently masking drift.
+    """
+    raw = getattr(task, "asset_type", None)
+    if not isinstance(raw, str):
+        return None
+    if raw in {"stock", "index"}:
+        return raw
+    # 任何真实字符串只要不精确等于字面量域（含空串、纯空白、大小写或带
+    # 空格形态）都必须记录 warning 后降级，避免静默掩盖漂移；仅非字符串
+    # 代理（如 MagicMock 子对象）保持静默 None。
+    logger.warning(
+        "task asset_type 超出字面量域，降级为 None: task_id=%s asset_type=%r",
+        getattr(task, "task_id", None),
+        raw,
+    )
     return None
 
 
@@ -225,32 +261,68 @@ def _is_obviously_invalid_analysis_input(text: str) -> bool:
     return has_letters and has_digits
 
 
-def _resolve_and_normalize_input(raw_value: str) -> str:
+def _resolve_analysis_input(raw_value: str):
     """
-    Resolve and normalize a stock input for analysis requests.
+    Resolve one analysis request input into ``(code, analysis_target)``.
 
-    Code-like values keep the existing canonical path.
-    Non-code inputs must resolve to a known stock code. Obvious garbage
-    input is rejected before expensive resolver and task-queue work.
+    Code-like tokens go through :func:`parse_analysis_target` (the single
+    asset-type authority): registered indices keep their structured
+    ``AnalysisTarget`` (canonical id + index semantics), unsupported targets
+    (e.g. unregistered ``930956.CSI``) are surfaced with their reason so the
+    caller can reject them explicitly, and stock tokens keep the legacy
+    resolution path. Non-code names (e.g. ``贵州茅台``) keep
+    :func:`resolve_name_to_code` and never enter index classification.
     """
     text = (raw_value or "").strip()
     if not text:
-        return ""
+        return None
+
+    # CSI explicit forms (``csi930955`` / ``930955.CSI`` / ``CSI930955``) are
+    # explicit code forms but ``is_code_like`` does not recognise the ``.CSI``
+    # suffix; route them through parse_analysis_target so registered CSI
+    # converges to its canonical index identity and unregistered CSI surfaces
+    # as an explicit unsupported error (never a name-resolution fallback).
+    normalized_csi = unicodedata.normalize("NFKC", text).strip().casefold()
+    if re.fullmatch(r"(?:csi\d{6}|\d{6}\.csi)", normalized_csi):
+        target = parse_analysis_target(text)
+        if target.asset_type == ParseStatus.INDEX:
+            return (target.canonical_id, target)
+        return (text, target)
+
+    # SH/SZ prefixed six-digit forms (``sh000016`` / ``SH000016``) are explicit
+    # index/stock code shapes, but ``is_code_like`` rejects them when the bare
+    # digits do not match the exchange's *stock* digit rules (``000016`` is an
+    # SH index yet classifies as an SZ stock digit shape). Route them through
+    # parse_analysis_target so registered SH/SZ indices keep their structured
+    # target; unknown prefixed forms degrade to the stock path as usual.
+    normalized_sh_sz = re.fullmatch(r"(sh|sz)(\d{6})", normalized_csi)
+    if normalized_sh_sz is not None:
+        target = parse_analysis_target(text)
+        if target.asset_type == ParseStatus.INDEX:
+            return (target.canonical_id, target)
+        return (resolve_index_stock_code_for_analysis(text), None)
 
     if is_code_like(text):
-        return resolve_index_stock_code_for_analysis(text)
+        target = parse_analysis_target(text)
+        if target.asset_type == ParseStatus.INDEX:
+            return (target.canonical_id, target)
+        if target.asset_type == ParseStatus.UNSUPPORTED:
+            return (text, target)
+        # Stock target: keep the existing canonical resolution path and do not
+        # carry a stock target downstream (stock semantics must not change).
+        return (resolve_index_stock_code_for_analysis(text), None)
 
     if text.isdigit() and len(text) == 4:
         resolved_index_code = resolve_index_stock_code_for_analysis(text)
         if resolved_index_code != canonical_stock_code(text):
-            return resolved_index_code
+            return (resolved_index_code, None)
 
     if _is_obviously_invalid_analysis_input(text):
         raise _invalid_analysis_input_error()
 
     resolved = resolve_name_to_code(text)
     if resolved:
-        return canonical_stock_code(resolved)
+        return (canonical_stock_code(resolved), None)
 
     raise _invalid_analysis_input_error()
 
@@ -312,29 +384,56 @@ def trigger_analysis(
     if not stock_codes:
         raise api_error(400, "validation_error", "必须提供 stock_code 或 stock_codes 参数")
 
+    # Limit the number of non-blank raw tokens BEFORE resolution. Rejected and
+    # duplicate tokens must also count toward the cap, otherwise a request that
+    # mixes one valid token with many rejected/duplicate tokens could bypass the
+    # DoS limit via the post-dedup check below.
+    MAX_BATCH_SIZE = 50
+    non_empty_raw_tokens = [c for c in stock_codes if str(c or "").strip()]
+    if len(non_empty_raw_tokens) > MAX_BATCH_SIZE:
+        raise api_error(400, "validation_error", f"单次分析请求最多支持 {MAX_BATCH_SIZE} 只股票")
+
     # Normalize and de-duplicate inputs while preserving compatibility.
-    resolved = [_resolve_and_normalize_input(c) for c in stock_codes]
-    
+    # Code-like tokens go through parse_analysis_target (the single asset-type
+    # authority) so registered indices keep their structured target; non-code
+    # names keep the legacy stock-name resolution path.
+    resolved_entries = [_resolve_analysis_input(c) for c in stock_codes]
+
     seen = set()
     unique_codes = []
-    for code in resolved:
+    unique_targets = []
+    rejected_entries = []
+    for entry in resolved_entries:
+        if entry is None:
+            continue
+        code, target = entry
         if not code:
             continue
-        # Use normalize_stock_code to ensure '600519' and '600519.SH' are merged
-        norm = normalize_stock_code(code)
+        if target is not None and target.asset_type == ParseStatus.UNSUPPORTED:
+            rejected_entries.append((code, target))
+            continue
+        # 去重键按 asset_type 分支：INDEX 用 canonical_id（指数与同码股票不折叠、
+        # CSI alias 收敛），STOCK 保持 normalize_stock_code 既有语义
+        # （'600519' 与 '600519.SH' 合并）。
+        if target is not None and target.asset_type == ParseStatus.INDEX:
+            norm = target.canonical_id
+        else:
+            norm = normalize_stock_code(code)
         if norm not in seen:
             seen.add(norm)
             unique_codes.append(code)
-    
+            unique_targets.append(target)
+
     stock_codes = unique_codes
 
-    # Limit the number of stocks in a single request to prevent DoS
-    MAX_BATCH_SIZE = 50
-    if len(stock_codes) > MAX_BATCH_SIZE:
-        raise api_error(400, "validation_error", f"单次分析请求最多支持 {MAX_BATCH_SIZE} 只股票")
-
     if not stock_codes:
-        raise api_error(400, "validation_error", "股票代码不能为空或仅包含空白字符")
+        if not rejected_entries:
+            raise api_error(400, "validation_error", "股票代码不能为空或仅包含空白字符")
+        # 全部目标都被拒绝（单请求或批量全拒）：无任务被接受时返回 202 会误导
+        # 客户端，一律明确 400；部分被拒则走下方 rejected 语义。
+        code, target = rejected_entries[0]
+        reason = target.unsupported_reason or f"不支持的目标: {code}"
+        raise api_error(400, "validation_error", reason)
 
     # Sync mode only supports single-stock analysis.
     if not request.async_mode:
@@ -344,25 +443,45 @@ def trigger_analysis(
                 "validation_error",
                 "同步模式仅支持单只股票分析，请使用 async_mode=true 进行批量分析",
             )
-        return _handle_sync_analysis(stock_codes[0], request)
+        if rejected_entries:
+            # 同步模式不支持 rejected 语义：只要存在被拒绝目标（含全部被拒绝）
+            # 就以第一个未登记目标的明确校验错误返回 4xx。
+            code, target = rejected_entries[0]
+            reason = target.unsupported_reason or f"不支持的目标: {code}"
+            raise api_error(400, "validation_error", reason)
+        return _handle_sync_analysis(stock_codes[0], request, analysis_target=unique_targets[0] if unique_targets else None)
 
     # Async mode submits one task per stock.
-    return _handle_async_analysis_batch(stock_codes, request)
+    return _handle_async_analysis_batch(stock_codes, request, analysis_targets=unique_targets, rejected_entries=rejected_entries)
 
 
 def _handle_async_analysis_batch(
     stock_codes: list,
-    request: AnalyzeRequest
+    request: AnalyzeRequest,
+    analysis_targets: Optional[list] = None,
+    rejected_entries: Optional[list] = None,
 ) -> JSONResponse:
     """
     Handle asynchronous analysis requests, including batch submission.
+
+    Args:
+        stock_codes: canonical codes to submit
+        request: the analysis request
+        analysis_targets: optional per-code structured targets (index targets
+            flow through to the pipeline)
+        rejected_entries: optional list of ``(code, target)`` pairs that were
+            explicitly rejected (e.g. unregistered CSI); returned in the
+            ``rejected`` field for batch requests only.
     """
     task_queue = get_task_queue()
     
     # Preserve metadata for single-stock requests. For batch requests,
     # only carry through metadata that semantically applies to the whole
     # batch, such as import/image source tracking.
-    is_single = len(stock_codes) == 1
+    # A single "accepted" code alongside any rejected entries is a batch:
+    # rejected entries mean the server has not fully disposed of a single-stock
+    # request, so single-stock metadata/409/single-202 semantics must not apply.
+    is_single = len(stock_codes) == 1 and not rejected_entries
     preserve_batch_metadata = request.selection_source in {"import", "image"}
 
     stock_name = request.stock_name if is_single else None
@@ -387,6 +506,10 @@ def _handle_async_analysis_batch(
         submit_kwargs["report_language"] = report_language
     if skills is not None:
         submit_kwargs["skills"] = skills
+    # 仅当存在非 None 的结构化 target（如指数）时才传递，保持纯股票请求
+    # 的既有 kwargs 契约不变。
+    if analysis_targets is not None and any(t is not None for t in analysis_targets):
+        submit_kwargs["analysis_targets"] = analysis_targets
 
     accepted_tasks, duplicate_errors = task_queue.submit_tasks_batch(**submit_kwargs)
 
@@ -398,6 +521,7 @@ def _handle_async_analysis_batch(
             status="pending",
             message=f"分析任务已加入队列: {task.stock_code}",
             analysis_phase=task.analysis_phase,
+            asset_type=_task_asset_type(task),
         )
         for task in accepted_tasks
     ]
@@ -409,9 +533,16 @@ def _handle_async_analysis_batch(
         )
         for dup in duplicate_errors
     ]
+    rejected = [
+        RejectedTaskItem(
+            stock_code=code,
+            message=(target.unsupported_reason or f"不支持的目标: {code}"),
+        )
+        for code, target in (rejected_entries or [])
+    ]
     
     # 单只股票且被拒绝：保持 409 兼容性
-    if len(stock_codes) == 1 and duplicates:
+    if is_single and duplicates:
         dup = duplicates[0]
         error_response = DuplicateTaskErrorResponse(
             error="duplicate_task",
@@ -424,8 +555,8 @@ def _handle_async_analysis_batch(
             content=error_response.model_dump()
         )
     
-    # 单只股票成功：保持原有响应格式兼容性
-    if len(stock_codes) == 1 and accepted:
+    # 单只股票成功（且无 rejected）：保持原有响应格式兼容性
+    if is_single and accepted and not rejected:
         task_accepted = TaskAccepted(
             task_id=accepted[0].task_id,
             trace_id=accepted[0].trace_id,
@@ -438,11 +569,17 @@ def _handle_async_analysis_batch(
             content=task_accepted.model_dump()
         )
     
-    # 批量：返回汇总结果
+    # 批量：返回汇总结果（rejected 仅 async 批量返回）
+    rejected_count = len(rejected)
+    if rejected_count:
+        message = f"已提交 {len(accepted)} 个任务，{len(duplicates)} 个重复跳过，{rejected_count} 个被拒绝"
+    else:
+        message = f"已提交 {len(accepted)} 个任务，{len(duplicates)} 个重复跳过"
     batch_response = BatchTaskAcceptedResponse(
         accepted=accepted,
         duplicates=duplicates,
-        message=f"已提交 {len(accepted)} 个任务，{len(duplicates)} 个重复跳过",
+        rejected=rejected if rejected else None,
+        message=message,
     )
     return JSONResponse(
         status_code=202,
@@ -452,7 +589,8 @@ def _handle_async_analysis_batch(
 
 def _handle_sync_analysis(
     stock_code: str,
-    request: AnalyzeRequest
+    request: AnalyzeRequest,
+    analysis_target: Optional[Any] = None,
 ) -> AnalysisResultResponse:
     """
     处理同步分析请求
@@ -475,6 +613,7 @@ def _handle_sync_analysis(
             skills=getattr(request, "skills", None),
             analysis_phase=request.analysis_phase,
             report_language=getattr(request, "report_language", None),
+            analysis_target=analysis_target,
         )
 
         if result is None:
@@ -646,6 +785,7 @@ def get_task_list(
             analysis_phase=t.analysis_phase,
             skills=getattr(t, "skills", None),
             region=t.region,
+            asset_type=_task_asset_type(t),
         )
         for t in all_tasks
     ]
@@ -1173,6 +1313,11 @@ def get_analysis_status(task_id: str) -> TaskStatus:
                 context_snapshot,
                 raw_result,
             )
+            news_disclosure = empty_news_disclosure_from_stored(
+                raw_result,
+                context_snapshot,
+                report_language,
+            )
             has_board_details = (
                 bool(extracted_boards.get("belong_boards"))
                 or extracted_boards.get("sector_rankings") is not None
@@ -1185,9 +1330,11 @@ def get_analysis_status(task_id: str) -> TaskStatus:
                 or market_structure is not None
                 or context_snapshot is not None
                 or analysis_context_pack_overview is not None
+                or news_disclosure is not None
             ):
                 details = ReportDetails(
                     news_content=getattr(record, "news_content", None),
+                    empty_news_disclosure=news_disclosure,
                     raw_result=raw_result,
                     context_snapshot=api_context_snapshot,
                     analysis_context_pack_overview=analysis_context_pack_overview,
@@ -1224,6 +1371,7 @@ def get_analysis_status(task_id: str) -> TaskStatus:
                     current_price=current_price,
                     change_pct=change_pct,
                     market_phase_summary=market_phase_summary,
+                    asset_type=asset_type_from_canonical_code(record.code),
                 ),
                 summary=ReportSummary(
                     sentiment_score=record.sentiment_score,
@@ -1284,39 +1432,11 @@ def _load_sync_fundamental_sources(
     """
     Load report enrichment payloads for sync analyze response.
     """
-    try:
-        from src.storage import DatabaseManager
-
-        db = DatabaseManager.get_instance()
-        records = db.get_analysis_history(query_id=query_id, code=stock_code, limit=1)
-        context_snapshot = None
-        raw_result_snapshot = None
-        if records:
-            latest_record = records[0]
-            context_snapshot = parse_json_field(getattr(latest_record, "context_snapshot", None))
-            raw_result_snapshot = parse_json_field(getattr(latest_record, "raw_result", None))
-
-        fallback_fundamental = db.get_latest_fundamental_snapshot(
-            query_id=query_id,
-            code=stock_code,
-        )
-        return context_snapshot, fallback_fundamental, raw_result_snapshot
-    except Exception as e:
-        logger.debug(
-            "load sync fundamental sources failed (fail-open): query_id=%s stock_code=%s err=%s",
-            query_id,
-            stock_code,
-            e,
-        )
-        return None, None, None
+    return load_sync_fundamental_sources(query_id=query_id, stock_code=stock_code)
 
 
 def _stringify_report_strategy_value(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value
-    return str(value)
+    return stringify_report_strategy_value(value)
 
 
 def _build_analysis_report(
@@ -1329,177 +1449,25 @@ def _build_analysis_report(
         fallback_raw_result_payload: Optional[Any] = None,
 ) -> AnalysisReport:
     """
-    构建符合 API 规范的分析报告
-    
-    Args:
-        report_data: 原始报告数据
-        query_id: 查询 ID
-        stock_code: 股票代码
-        stock_name: 股票名称
-        context_snapshot: 上下文快照（可选）
-        fallback_fundamental_payload: 基本面快照 payload（可选）
-        fallback_raw_result_payload: 原始分析结果 payload（可选）
-        
-    Returns:
-        AnalysisReport: 结构化的分析报告
+    构建符合 API 规范的分析报告（委托服务层统一组装契约，保持 REST 与 MCP 一致）。
     """
-    meta_data = report_data.get("meta", {})
-    summary_data = report_data.get("summary", {})
-    strategy_data = report_data.get("strategy", {})
-    details_data = report_data.get("details", {})
-    report_language = normalize_report_language(
-        meta_data.get("report_language")
-        or (context_snapshot or {}).get("report_language")
-        or getattr(Config.get_instance(), "report_language", "zh")
-    )
-    display_stock_code = _display_stock_code_from_index(meta_data.get("stock_code", stock_code))
-    localized_stock_name = get_localized_stock_name(
-        meta_data.get("stock_name", stock_name),
-        display_stock_code,
-        report_language,
-    )
-    realtime_fields = extract_realtime_detail_fields(context_snapshot)
-    current_price = meta_data.get("current_price")
-    if current_price is None:
-        current_price = realtime_fields.get("current_price")
-    change_pct = meta_data.get("change_pct")
-    if change_pct is None:
-        change_pct = realtime_fields.get("change_pct")
-    raw_stock_code = meta_data.get("stock_code", stock_code)
-    market_phase_summary = _display_market_phase_summary(raw_stock_code, context_snapshot)
-    if market_phase_summary is None:
-        meta_phase_summary = meta_data.get("market_phase_summary")
-        if meta_phase_summary is not None:
-            market_phase_summary = _display_market_phase_summary(
-                raw_stock_code,
-                {"market_phase_summary": meta_phase_summary},
-            )
-
-    meta = ReportMeta(
-        query_id=meta_data.get("query_id", query_id),
-        stock_code=display_stock_code,
-        stock_name=localized_stock_name,
-        report_type=meta_data.get("report_type", "detailed"),
-        report_language=report_language,
-        created_at=meta_data.get("created_at", datetime.now().isoformat()),
-        current_price=current_price,
-        change_pct=change_pct,
-        model_used=normalize_model_used(meta_data.get("model_used")),
-        market_phase_summary=market_phase_summary,
-    )
-
-    def _looks_like_raw_result_payload(candidate: Any) -> bool:
-        return (
-            isinstance(candidate, dict)
-            and (
-                "analysis_summary" in candidate
-                or "operation_advice" in candidate
-                or "trend_prediction" in candidate
-                or "sentiment_score" in candidate
-                or "market_structure_context" in candidate
-                or "model_used" in candidate
-                or "dashboard" in candidate
-                or "action" in candidate
-            )
-        )
-
-    raw_result_data = details_data.get("raw_result")
-    if not isinstance(raw_result_data, dict):
-        raw_result_data = {}
-        if isinstance(fallback_raw_result_payload, dict):
-            if isinstance(fallback_raw_result_payload.get("raw_result"), dict):
-                raw_result_data = fallback_raw_result_payload["raw_result"]
-            elif _looks_like_raw_result_payload(fallback_raw_result_payload):
-                raw_result_data = fallback_raw_result_payload
-        if not raw_result_data and isinstance(details_data, dict):
-            raw_result_data = details_data
-    action_fields = build_action_fields(
-        operation_advice=(
-            raw_result_data.get("operation_advice")
-            or details_data.get("operation_advice")
-            or summary_data.get("operation_advice")
-        ),
-        explicit_action=raw_result_data.get("action") or details_data.get("action") or summary_data.get("action"),
-        report_type=meta.report_type,
-        report_language=report_language,
-        sentiment_score=_first_non_empty_report_value(
-            summary_data.get("sentiment_score"),
-            raw_result_data.get("sentiment_score"),
-            details_data.get("sentiment_score"),
-        ),
-        guardrail_reason=_extract_guardrail_reason(raw_result_data),
-        align_with_score=True,
-    )
-
-    summary = ReportSummary(
-        analysis_summary=summary_data.get("analysis_summary"),
-        operation_advice=summary_data.get("operation_advice"),
-        action=action_fields["action"],
-        action_label=action_fields["action_label"],
-        trend_prediction=summary_data.get("trend_prediction"),
-        sentiment_score=summary_data.get("sentiment_score"),
-        sentiment_label=summary_data.get("sentiment_label")
-    )
-
-    strategy = None
-    if strategy_data:
-        strategy = ReportStrategy(
-            ideal_buy=_stringify_report_strategy_value(strategy_data.get("ideal_buy")),
-            secondary_buy=_stringify_report_strategy_value(strategy_data.get("secondary_buy")),
-            stop_loss=_stringify_report_strategy_value(strategy_data.get("stop_loss")),
-            take_profit=_stringify_report_strategy_value(strategy_data.get("take_profit"))
-        )
-
-    extracted_fundamental = extract_fundamental_detail_fields(
+    payload = build_analysis_report_payload(
+        report_data=report_data,
+        query_id=query_id,
+        stock_code=stock_code,
+        stock_name=stock_name,
         context_snapshot=context_snapshot,
         fallback_fundamental_payload=fallback_fundamental_payload,
+        fallback_raw_result_payload=fallback_raw_result_payload,
     )
-    extracted_boards = extract_board_detail_fields(
-        context_snapshot=context_snapshot,
-        fallback_fundamental_payload=fallback_fundamental_payload,
-    )
-    market_structure = None
-    for raw_candidate in (fallback_raw_result_payload, raw_result_data, details_data):
-        if raw_candidate is None:
-            continue
-        market_structure = extract_market_structure_detail_field(
-            context_snapshot,
-            raw_candidate,
-        )
-        if market_structure is not None:
-            break
-    analysis_context_pack_overview = extract_analysis_context_pack_overview(context_snapshot)
-    api_context_snapshot = sanitize_context_snapshot_for_api(context_snapshot)
-    details = None
-    has_board_details = (
-        bool(extracted_boards.get("belong_boards"))
-        or extracted_boards.get("sector_rankings") is not None
-        or extracted_boards.get("concept_rankings") is not None
-    )
-    if (
-        details_data
-        or any(extracted_fundamental.values())
-        or has_board_details
-        or market_structure is not None
-        or context_snapshot is not None
-        or analysis_context_pack_overview is not None
-    ):
-        details = ReportDetails(
-            news_content=details_data.get("news_summary") or details_data.get("news_content"),
-            raw_result=raw_result_data,
-            context_snapshot=api_context_snapshot,
-            analysis_context_pack_overview=analysis_context_pack_overview,
-            financial_report=extracted_fundamental.get("financial_report"),
-            dividend_metrics=extracted_fundamental.get("dividend_metrics"),
-            belong_boards=extracted_boards.get("belong_boards"),
-            sector_rankings=extracted_boards.get("sector_rankings"),
-            concept_rankings=extracted_boards.get("concept_rankings"),
-            market_structure=market_structure,
-        )
-
+    meta = ReportMeta(**payload["meta"])
+    summary = ReportSummary(**payload["summary"])
+    strategy = ReportStrategy(**payload["strategy"]) if payload.get("strategy") is not None else None
+    details = ReportDetails(**payload["details"]) if payload.get("details") is not None else None
     return AnalysisReport(
         meta=meta,
         summary=summary,
         strategy=strategy,
-        details=details
+        details=details,
+        structured_report=payload.get("structured_report"),
     )

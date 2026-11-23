@@ -6,12 +6,14 @@ Normalizes function-calling / tool-use across all providers into a unified
 interface consumed by the AgentExecutor, via LiteLLM.
 """
 
+import copy
 import json
 import logging
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import litellm
 from litellm import Router
@@ -35,6 +37,7 @@ from src.agent.provider_trace import (
     trace_model_matches,
 )
 from src.llm.errors import call_litellm_with_param_recovery
+from src.core.stock_execution_context import raise_if_stock_cancelled
 from src.llm.backend_registry import (
     AUTO_AGENT_BACKEND_ID,
     GENERATION_ONLY_BACKEND_IDS,
@@ -52,6 +55,12 @@ from src.llm.provider_cache import (
 )
 
 logger = logging.getLogger(__name__)
+
+# 本项目不注册 LiteLLM success callback，用量从响应自身统计。LiteLLM 默认会为每个
+# streaming chunk 向全局线程池提交一次 asyncio.run() 日志任务；Windows 上每次都会新建
+# Proactor 事件循环和回环 socketpair，长报告产生数千次，既耗 CPU，又会让线程池卡在
+# socketpair 的 accept() 上，导致 CLI 打印「程序执行完成」后进程无法退出。
+litellm.disable_streaming_logging = True
 
 
 def _resolve_litellm_exception(name: str) -> type[BaseException]:
@@ -90,7 +99,7 @@ class LLMResponse:
     provider_blocks: List[Dict[str, Any]] = field(default_factory=list)  # Opaque provider content blocks (e.g. Claude thinking/redacted_thinking)
     usage: Dict[str, Any] = field(default_factory=dict)       # token usage info
     provider: str = ""                     # which provider handled this call
-    model: str = ""                        # full model name used (e.g. gemini/gemini-2.0-flash), for report meta
+    model: str = ""                        # full model name used (e.g. gemini/gemini-3.6-flash), for report meta
     raw: Any = None                        # raw provider response for debugging
 
 
@@ -102,9 +111,17 @@ _OPT_IN_THINKING_MODELS: Dict[str, dict] = {
     "deepseek-chat": {"thinking": {"type": "enabled"}},
 }
 
+# Reasoning models whose hidden reasoning can exhaust the whole completion
+# budget and return HTTP 200 with empty ``content``. Capping the effort keeps
+# the final answer inside ``max_tokens``.
+_REASONING_EFFORT_LOW_MODELS: Dict[str, dict] = {
+    "minimax-m3.1-flash": {"reasoning_effort": "low"},
+}
+
 # Custom model pricing for models not in LiteLLM's built-in price list.
 # Official MiniMax pricing: https://platform.minimax.io/docs/guides/pricing-paygo
-# - MiniMax-M3: $0.6/M input tokens, $2.4/M output tokens for prompts <=512K input
+# - MiniMax-M3.1-Flash: $0.15/M input, $0.60/M output, $0.015/M cache reads.
+# - MiniMax-M3: $0.3/M input tokens, $1.2/M output tokens for prompts <=512K input
 #   tokens. Officially supports up to 1M input tokens with a separate higher
 #   price tier for the >512K bucket; we conservatively register only the
 #   <=512K bucket here because the cost tracker carries a single per-token
@@ -116,6 +133,17 @@ _OPT_IN_THINKING_MODELS: Dict[str, dict] = {
 #   accurate cost. Still listed as a Legacy Model on the official pricing
 #   page; remove only after we have user-facing migration guidance.
 _CUSTOM_MODEL_PRICING: Dict[str, dict] = {
+    "MiniMax-M3.1-Flash": {
+        "supports_function_calling": True,
+        "supports_vision": True,
+        "supports_audio_input": False,
+        "supports_audio_output": False,
+        "context_window": 1000000,
+        "max_tokens": 524288,
+        "input_cost_per_token": 0.00000015,
+        "output_cost_per_token": 0.0000006,
+        "cache_read_input_token_cost": 0.000000015,
+    },
     "MiniMax-M3": {
         "supports_function_calling": True,
         "supports_vision": True,
@@ -126,8 +154,9 @@ _CUSTOM_MODEL_PRICING: Dict[str, dict] = {
         # changes above 512K; see comment block above.
         "context_window": 512000,
         "max_tokens": 128000,
-        "input_cost_per_token": 0.0000006,   # $0.6 / 1M tokens (<=512K input bucket)
-        "output_cost_per_token": 0.0000024,   # $2.4 / 1M tokens (<=512K input bucket)
+        "input_cost_per_token": 0.0000003,   # $0.3 / 1M tokens (<=512K input bucket)
+        "output_cost_per_token": 0.0000012,   # $1.2 / 1M tokens (<=512K input bucket)
+        "cache_read_input_token_cost": 0.00000006,
     },
     "MiniMax-M2.7": {
         "supports_function_calling": True,
@@ -289,11 +318,77 @@ def get_thinking_extra_body(model: str) -> Optional[dict]:
       Return None to avoid duplicate activation.
     - Opt-in models (_OPT_IN_THINKING_MODELS: deepseek-chat): Return the activation
       payload to explicitly enable thinking mode.
+    - Budget-capped reasoning models (_REASONING_EFFORT_LOW_MODELS: MiniMax-M3.1-Flash):
+      Return a low-effort payload so hidden reasoning cannot consume the whole
+      completion budget and leave an empty answer.
     - All other models: Return None (no thinking mode).
     """
     if _model_matches(model, _AUTO_THINKING_MODELS):
         return None
-    return _get_opt_in_payload(model, _OPT_IN_THINKING_MODELS)
+    return (
+        _get_opt_in_payload(model, _OPT_IN_THINKING_MODELS)
+        or _get_opt_in_payload(model, _REASONING_EFFORT_LOW_MODELS)
+    )
+
+
+def merge_thinking_extra_body(
+    params: Mapping[str, Any],
+    default_extra: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Merge default thinking/reasoning extra_body without overwriting explicit config.
+
+    Precedence: explicit deployment/request configuration (either inside
+    ``extra_body`` or as a matching top-level parameter such as
+    ``reasoning_effort`` or ``thinking``) always wins over defaults.
+    Returns ``None`` when there is nothing to set or when an existing non-dict
+    ``extra_body`` should be left untouched.
+    """
+    existing_extra = params.get("extra_body")
+    if existing_extra is not None and not isinstance(existing_extra, Mapping):
+        return None
+    merged: Dict[str, Any] = copy.deepcopy(dict(existing_extra)) if isinstance(existing_extra, Mapping) else {}
+    if not default_extra:
+        return merged if isinstance(existing_extra, Mapping) else None
+    added = False
+    for key, value in default_extra.items():
+        if key in merged or (key in params and params.get(key) is not None):
+            continue
+        merged[key] = copy.deepcopy(value)
+        added = True
+    if not added and not isinstance(existing_extra, Mapping):
+        return None
+    return merged
+
+
+def apply_thinking_extra_body_to_model_list(
+    model_list: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Return a copied Router model_list with per-deployment default extra_body merged."""
+    prepared: List[Dict[str, Any]] = []
+    for entry in model_list or []:
+        if not isinstance(entry, dict):
+            prepared.append(entry)
+            continue
+        raw_params = entry.get("litellm_params")
+        if not isinstance(raw_params, dict):
+            prepared.append(dict(entry))
+            continue
+        wire_model = str(raw_params.get("model") or entry.get("model_name") or "").strip()
+        model_short = wire_model.split("/")[-1] if "/" in wire_model else wire_model
+        default_extra = get_thinking_extra_body(model_short)
+        if not default_extra:
+            prepared.append(dict(entry))
+            continue
+        merged_extra = merge_thinking_extra_body(raw_params, default_extra)
+        if merged_extra is None:
+            prepared.append(dict(entry))
+            continue
+        new_params = dict(raw_params)
+        new_params["extra_body"] = merged_extra
+        new_entry = dict(entry)
+        new_entry["litellm_params"] = new_params
+        prepared.append(new_entry)
+    return prepared
 
 
 def resolve_fallback_litellm_wire_models(
@@ -345,6 +440,7 @@ class LLMToolAdapter:
         config = config or get_config()
         self._config = config
         self._router = None          # litellm Router (multi-key primary model)
+        self._router_has_merged_extra_body = False
         self._legacy_router_model_list: List[Dict[str, Any]] = []
         self._litellm_available = False
         self._backend_error: Optional[GenerationError] = None
@@ -369,6 +465,7 @@ class LLMToolAdapter:
                 logger.debug(f"Registered custom pricing for {model_name}")
             except Exception as e:
                 logger.debug(f"Model {model_name} may already be registered or pricing error: {e}")
+
     def _has_channel_config(self) -> bool:
         """Check if multi-channel config (channels / YAML) is active."""
         return bool(self._config.llm_model_list) and not all(
@@ -378,6 +475,7 @@ class LLMToolAdapter:
     def _init_litellm(self) -> None:
         """Initialize litellm Router from channels / YAML / legacy keys."""
         config = self._config
+        self._router_has_merged_extra_body = False
         self._legacy_router_model_list = []
         try:
             self._generation_backend_id = resolve_agent_generation_backend_id(config)
@@ -474,17 +572,19 @@ class LLMToolAdapter:
                 )
                 logger.warning("Agent LLM: no Agent-safe channel deployments after Hermes filtering")
                 return
+            prepared_model_list = apply_thinking_extra_body_to_model_list(model_list)
             self._router = Router(
-                model_list=model_list,
+                model_list=prepared_model_list,
                 routing_strategy="simple-shuffle",
                 num_retries=2,
             )
+            self._router_has_merged_extra_body = True
             unique_models = list(dict.fromkeys(
                 e['litellm_params']['model'] for e in model_list
             ))
             logger.info(
                 f"Agent LLM: Router initialized from channels/YAML — "
-                f"{len(model_list)} deployment(s), models: {unique_models}"
+                f"{len(prepared_model_list)} deployment(s), models: {unique_models}"
             )
             return
 
@@ -500,7 +600,7 @@ class LLMToolAdapter:
 
         if len(keys) > 1:
             ep = extra_litellm_params(litellm_model, config)
-            legacy_model_list = [
+            legacy_model_list = apply_thinking_extra_body_to_model_list([
                 {
                     "model_name": litellm_model,
                     "litellm_params": {
@@ -510,13 +610,14 @@ class LLMToolAdapter:
                     },
                 }
                 for k in keys
-            ]
+            ])
             self._legacy_router_model_list = legacy_model_list
             self._router = Router(
                 model_list=legacy_model_list,
                 routing_strategy="simple-shuffle",
                 num_retries=2,
             )
+            self._router_has_merged_extra_body = True
             logger.info(
                 f"Agent LLM: Legacy Router initialized with {len(keys)} keys "
                 f"for {litellm_model}"
@@ -617,6 +718,7 @@ class LLMToolAdapter:
         last_error = None
         hit_rate_limit = False
         for idx, model in enumerate(models_to_try):
+            raise_if_stock_cancelled()
             remaining_timeout = timeout
             if timeout is not None and timeout > 0:
                 remaining_timeout = max(0.0, float(timeout) - (time.time() - started_at))
@@ -635,6 +737,7 @@ class LLMToolAdapter:
                     timeout=remaining_timeout,
                 )
             except Exception as e:
+                raise_if_stock_cancelled()
                 if isinstance(e, _resolve_litellm_exception("RateLimitError")):
                     logger.warning("Agent LLM rate-limited on %s: %s", model, e)
                     last_error = e
@@ -701,9 +804,6 @@ class LLMToolAdapter:
         if timeout is not None:
             call_kwargs["timeout"] = timeout
 
-        if extra:
-            call_kwargs["extra_body"] = extra
-
         if tools:
             call_kwargs["tools"] = tools
 
@@ -719,11 +819,17 @@ class LLMToolAdapter:
         recovery_model_list = resolution.model_list or self._config.llm_model_list
         if self._router and model == agent_primary_model and not use_channel_router:
             recovery_model_list = self._legacy_router_model_list or self._config.llm_model_list
-        if not uses_router:
-            keys = get_api_keys_for_model(model, self._config)
-            if keys:
-                call_kwargs["api_key"] = keys[0]
-            call_kwargs.update(extra_litellm_params(model, self._config))
+        if uses_router and getattr(self, "_router_has_merged_extra_body", False):
+            recovery_model_list = apply_thinking_extra_body_to_model_list(recovery_model_list)
+        else:
+            if not uses_router:
+                keys = get_api_keys_for_model(model, self._config)
+                if keys:
+                    call_kwargs["api_key"] = keys[0]
+                call_kwargs.update(extra_litellm_params(model, self._config))
+            merged_extra = merge_thinking_extra_body(call_kwargs, extra)
+            if merged_extra is not None:
+                call_kwargs["extra_body"] = merged_extra
         call_kwargs = apply_litellm_generation_params(
             call_kwargs,
             model,
@@ -792,6 +898,34 @@ class LLMToolAdapter:
         """Return the raw configured temperature before per-model normalization."""
         return float(self._config.llm_temperature)
 
+    @staticmethod
+    def _normalize_nonfinite(value: Any) -> Any:
+        """Recursively convert non-finite floats (NaN / +/-Infinity) to None.
+
+        Dicts, lists and tuples are rebuilt without mutating the original
+        values; finite numbers, strings (including literal ``"NaN"``) and all
+        other types pass through unchanged.
+        """
+        if isinstance(value, float):
+            return None if math.isnan(value) or math.isinf(value) else value
+        if isinstance(value, dict):
+            return {key: LLMToolAdapter._normalize_nonfinite(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            normalized = [LLMToolAdapter._normalize_nonfinite(item) for item in value]
+            return tuple(normalized) if isinstance(value, tuple) else normalized
+        return value
+
+    @classmethod
+    def _nan_safe_dumps(cls, value: Any) -> str:
+        """Serialize to strict RFC 8259 JSON for the provider wire format.
+
+        Normalizes non-finite floats to ``null`` first, then dumps with
+        ``allow_nan=False`` so any unhandled non-finite numeric value fails
+        locally instead of emitting invalid JSON that LiteLLM rejects with
+        ``BadRequestError: "NaN" is not valid JSON``.
+        """
+        return json.dumps(cls._normalize_nonfinite(value), allow_nan=False)
+
     def _convert_messages(
         self,
         messages: List[Dict[str, Any]],
@@ -813,7 +947,7 @@ class LLMToolAdapter:
                 openai_messages.append({
                     "role": "tool",
                     "tool_call_id": msg.get("tool_call_id", ""),
-                    "content": msg["content"] if isinstance(msg["content"], str) else json.dumps(msg["content"]),
+                    "content": msg["content"] if isinstance(msg["content"], str) else self._nan_safe_dumps(msg["content"]),
                 })
             elif msg["role"] == "assistant" and msg.get("tool_calls"):
                 openai_tc = []
@@ -823,7 +957,7 @@ class LLMToolAdapter:
                         "type": "function",
                         "function": {
                             "name": tc["name"],
-                            "arguments": json.dumps(tc["arguments"]),
+                            "arguments": self._nan_safe_dumps(tc["arguments"]),
                         },
                     }
                     provider_specific_fields = dict(tc.get("provider_specific_fields") or {})

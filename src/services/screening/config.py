@@ -13,6 +13,10 @@ from src.config import (
     find_llm_channel_surface_conflicts,
     normalize_llm_channel_api_surface,
     normalize_llm_channel_model,
+    resolve_llm_channel_base_url,
+    resolve_llm_channel_models,
+    resolve_llm_channel_api_keys,
+    resolve_llm_channel_names,
     resolve_llm_channel_protocol,
 )
 from src.llm.hermes import is_reserved_hermes_name
@@ -20,7 +24,7 @@ from src.llm.hermes import is_reserved_hermes_name
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_POST_ANALYZERS = ["scorecard"]
-DEFAULT_LLM_MODEL = "gemini/gemini-2.5-flash"
+DEFAULT_LLM_MODEL = "gemini/gemini-3.6-flash"
 DEFAULT_SNAPSHOT_SOURCE_PRIORITY = ["sina", "efinance", "akshare_em", "em_datacenter"]
 TUSHARE_FIRST_SOURCE_PRIORITY = ["tushare", "sina", "efinance", "akshare_em", "em_datacenter"]
 _ENV_FILE_CACHE: dict[Path, tuple[tuple[int, int], dict[str, str]]] = {}
@@ -413,13 +417,13 @@ def _parse_optional_float_env(name: str) -> float | None:
 
 def _parse_llm_channels_env() -> list[dict[str, object]]:
     channels = []
-    for raw_name in _parse_csv_env("LLM_CHANNELS", []):
+    for raw_name in resolve_llm_channel_names(os.environ).split(","):
         name = raw_name.strip()
         if not name:
             continue
         key = name.upper()
         enabled = _parse_bool_env(f"LLM_{key}_ENABLED", True)
-        base_url = os.getenv(f"LLM_{key}_BASE_URL", "").strip()
+        base_url = resolve_llm_channel_base_url(name, os.getenv(f"LLM_{key}_BASE_URL", ""))
         protocol = os.getenv(f"LLM_{key}_PROTOCOL", "").strip().lower()
         api_surface_raw = os.getenv(f"LLM_{key}_API_SURFACE", "")
         api_surface = normalize_llm_channel_api_surface(api_surface_raw)
@@ -427,7 +431,13 @@ def _parse_llm_channels_env() -> list[dict[str, object]]:
             _parse_csv_env(f"LLM_{key}_API_KEYS", [])
             or _parse_csv_env(f"LLM_{key}_API_KEY", [])
         )
-        models = _parse_csv_env(f"LLM_{key}_MODELS", [])
+        api_keys = resolve_llm_channel_api_keys(name, api_keys, os.environ)
+        models = resolve_llm_channel_models(
+            name, _parse_csv_env(f"LLM_{key}_MODELS", []),
+            channel_names=resolve_llm_channel_names(os.environ),
+            primary_model=os.getenv("LITELLM_MODEL", ""),
+            fallback_models=os.getenv("LITELLM_FALLBACK_MODELS", ""),
+        )
         resolved_protocol = resolve_llm_channel_protocol(
             protocol,
             base_url=base_url,
@@ -486,13 +496,13 @@ def _resolve_llm_model(channels: list[dict[str, object]]) -> str:
         ollama_model = os.getenv("OLLAMA_MODEL", "").strip()
         return f"ollama/{ollama_model}" if ollama_model else DEFAULT_LLM_MODEL
     if os.getenv("DEEPSEEK_API_KEY"):
-        return "deepseek/deepseek-chat"
+        return "deepseek/deepseek-v4-flash"
     if os.getenv("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEYS"):
         return _normalize_litellm_model(os.getenv("GEMINI_MODEL", DEFAULT_LLM_MODEL), "gemini")
     if os.getenv("OPENAI_API_KEY"):
-        return _normalize_litellm_model(os.getenv("OPENAI_MODEL", "gpt-4o-mini"), "openai")
+        return _normalize_litellm_model(os.getenv("OPENAI_MODEL", "gpt-6.1-sol"), "openai")
     if os.getenv("AIHUBMIX_KEY"):
-        return _normalize_litellm_model(os.getenv("OPENAI_MODEL", "gpt-4o-mini"), "openai")
+        return _normalize_litellm_model(os.getenv("OPENAI_MODEL", "gpt-6.1-sol"), "openai")
     return DEFAULT_LLM_MODEL
 
 

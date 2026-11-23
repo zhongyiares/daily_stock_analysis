@@ -41,7 +41,12 @@ from src.config import (
     parse_env_bool,
     parse_env_int,
     resolve_news_window_days,
+    resolve_llm_channel_base_url,
+    resolve_llm_channel_models,
+    resolve_llm_channel_api_keys,
+    resolve_llm_channel_names,
     resolve_llm_channel_protocol,
+    route_discovered_llm_model,
     setup_env,
 )
 from src.llm.hermes import (
@@ -127,6 +132,48 @@ class _LLMDiagnostic:
     details: Dict[str, Any] = field(default_factory=dict)
 
 
+def _inspect_dir_writable(path_value: Optional[str]) -> Tuple[bool, Optional[Path]]:
+    """Inspect whether target dir (or deepest existing ancestor) is writable without creating dirs."""
+    if not path_value:
+        return False, None
+    try:
+        target = Path(path_value).expanduser()
+        for node in (target, *target.parents):
+            if node.is_symlink() and not node.exists():
+                return False, node
+            if node.exists():
+                if not node.is_dir():
+                    return False, node
+                return os.access(node, os.W_OK | os.X_OK), node
+        return False, None
+    except OSError:
+        return False, None
+
+
+def check_dir_writable(path_value: Optional[str]) -> bool:
+    """Return True if path (or its deepest existing ancestor) is a writable directory."""
+    ok, _ = _inspect_dir_writable(path_value)
+    return ok
+
+
+def check_database_path_usable(db_path_value: Optional[str]) -> bool:
+    """Return True if DATABASE_PATH is a writable file or creatable under a writable directory."""
+    if not db_path_value:
+        return False
+    try:
+        target = Path(db_path_value).expanduser()
+        if target.is_symlink() and not target.exists():
+            return False
+        if target.exists():
+            if target.is_dir() or not target.is_file():
+                return False
+            return os.access(target, os.R_OK | os.W_OK) and check_dir_writable(str(target.parent))
+        parent = target.parent if target.parent != Path("") else Path(".")
+        return check_dir_writable(str(parent))
+    except OSError:
+        return False
+
+
 class SystemConfigService:
     """Service layer for reading, validating, and updating runtime configuration."""
 
@@ -162,6 +209,7 @@ class SystemConfigService:
         "DEEPSEEK_API_KEY",
         "DEEPSEEK_API_KEYS",
         "AIHUBMIX_KEY",
+        "MODELFLARE_KEY",
         "ANSPIRE_LLM_ENABLED",
         "ANSPIRE_LLM_BASE_URL",
         "ANSPIRE_LLM_MODEL",
@@ -406,7 +454,7 @@ class SystemConfigService:
         keys = set(registered_keys)
         channel_names = {
             segment.strip().upper()
-            for segment in config_map.get("LLM_CHANNELS", "").split(",")
+            for segment in resolve_llm_channel_names(config_map).split(",")
             if segment.strip()
         }
         if not channel_names:
@@ -432,8 +480,8 @@ class SystemConfigService:
         channel_names = {
             segment.strip().upper()
             for raw_channels in (
-                saved_config_map.get("LLM_CHANNELS", ""),
-                os.environ.get("LLM_CHANNELS", ""),
+                resolve_llm_channel_names(saved_config_map),
+                resolve_llm_channel_names(os.environ),
             )
             for segment in raw_channels.split(",")
             if segment.strip()
@@ -453,8 +501,11 @@ class SystemConfigService:
 
     def get_config(self, include_schema: bool = True, mask_token: str = "******") -> Dict[str, Any]:
         """Return display config values with mask metadata for server-masked fields."""
-        saved_config_map = self._build_display_config_map(self._manager.read_config_map())
-        runtime_config_map = self._build_runtime_display_config_map(saved_config_map)
+        with self._manager.locked():
+            config_version = self._manager.get_config_version()
+            saved_config_map = self._build_display_config_map(self._manager.read_config_map())
+            runtime_config_map = self._build_runtime_display_config_map(saved_config_map)
+            updated_at = self._manager.get_updated_at()
         config_map = {
             **runtime_config_map,
             **saved_config_map,
@@ -503,12 +554,28 @@ class SystemConfigService:
         )
 
         return {
-            "config_version": self._manager.get_config_version(),
+            "config_version": config_version,
             "mask_token": mask_token,
             "items": items,
+            # raw_value_exists only describes persistence in .env. The Web UI
+            # also needs to know whether a process-injected YAML path is the
+            # active LiteLLM source before hiding the generic runtime fields.
+            "llm_yaml_active": self._uses_litellm_yaml(config_map),
             "llm_model_providers": sorted(get_litellm_model_providers()),
-            "updated_at": self._manager.get_updated_at(),
+            "updated_at": updated_at,
         }
+
+    def get_watchlist_snapshot(self) -> Tuple[List[str], str]:
+        """Read the effective STOCK_LIST and its version in one snapshot."""
+        with self._manager.locked():
+            version = self._manager.get_config_version()
+            value = self._manager.read_config_map().get("STOCK_LIST", "")
+            if not value.strip():
+                value = os.getenv("STOCK_LIST", "")
+            current_version = self._manager.get_config_version()
+            if current_version != version:
+                raise ConfigConflictError(current_version=current_version)
+        return split_stock_list(value), version
 
     def validate(self, items: Sequence[Dict[str, str]], mask_token: str = "******") -> Dict[str, Any]:
         """Validate submitted items without writing to `.env`."""
@@ -950,6 +1017,7 @@ class SystemConfigService:
     ) -> Dict[str, Any]:
         """Discover available models from an OpenAI-compatible `/models` endpoint."""
         channel_name = name.strip() or "channel"
+        base_url = resolve_llm_channel_base_url(channel_name, base_url)
         resolved_secret, secret_error, redaction_values = self._resolve_hermes_saved_secret(
             channel_name=channel_name,
             protocol=protocol,
@@ -1173,7 +1241,10 @@ class SystemConfigService:
                 redaction_values=redaction_values,
             )
 
-        models = self._extract_discovered_llm_models(payload)
+        models = [
+            route_discovered_llm_model(model_id, base_url)
+            for model_id in self._extract_discovered_llm_models(payload)
+        ]
         if not models:
             return self._build_llm_channel_result(
                 success=False,
@@ -1221,6 +1292,14 @@ class SystemConfigService:
         requested_capabilities = self._normalize_llm_capability_checks(capability_checks)
         raw_models = [str(model).strip() for model in models if str(model).strip()]
         channel_name = name.strip() or "channel"
+        base_url = resolve_llm_channel_base_url(channel_name, base_url)
+        if not raw_models and channel_name.lower() == "modelflare":
+            effective_map = self._build_generation_backend_base_map()
+            raw_models = resolve_llm_channel_models(
+                channel_name, raw_models, channel_names=resolve_llm_channel_names(effective_map),
+                primary_model=effective_map.get("LITELLM_MODEL") or "",
+                fallback_models=effective_map.get("LITELLM_FALLBACK_MODELS") or "",
+            )
         resolved_api_surface = normalize_llm_channel_api_surface(api_surface)
         generation_stage = "responses" if resolved_api_surface == "responses" else "chat_completion"
         resolved_secret, secret_error, redaction_values = self._resolve_hermes_saved_secret(
@@ -2044,6 +2123,8 @@ class SystemConfigService:
         items: Sequence[Dict[str, str]],
         mask_token: str = "******",
         reload_now: bool = True,
+        *,
+        expected_watchlist: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Validate and persist updates into `.env`, then reload runtime config."""
         current_version = self._manager.get_config_version()
@@ -2069,25 +2150,45 @@ class SystemConfigService:
             if bool(field_schema.get("is_sensitive", False)):
                 sensitive_keys.add(key)
 
-        updated_keys, skipped_masked_keys, new_version = self._manager.apply_updates(
-            updates=updates,
-            sensitive_keys=sensitive_keys,
-            mask_token=mask_token,
-        )
-
         warnings: List[str] = []
         reload_triggered = False
-        if reload_now:
-            try:
-                Config.reset_instance()
-                self._reload_runtime_singletons()
-                setup_env(override=True)
-                config = Config.get_instance()
-                warnings.extend(config.validate())
-                reload_triggered = True
-            except Exception as exc:  # pragma: no cover - defensive branch
-                logger.error("Configuration reload failed: %s", exc, exc_info=True)
-                warnings.append("Configuration updated but reload failed")
+
+        def check_current() -> None:
+            if expected_watchlist is None:
+                current_version = self._manager.get_config_version()
+            else:
+                # An environment fallback can change while the file stays unchanged.
+                current_watchlist, current_version = self.get_watchlist_snapshot()
+                if current_watchlist != expected_watchlist:
+                    raise ConfigConflictError(current_version=current_version)
+            if current_version != config_version:
+                raise ConfigConflictError(current_version=current_version)
+
+        with self._manager.locked():
+            updated_keys, skipped_masked_keys, new_version = self._manager.apply_updates(
+                updates=updates,
+                sensitive_keys=sensitive_keys,
+                mask_token=mask_token,
+                check_current=check_current,
+            )
+
+            if reload_now:
+                try:
+                    if submitted_keys == {"STOCK_LIST"}:
+                        saved_list = self._manager.read_config_map().get("STOCK_LIST", "")
+                        os.environ["STOCK_LIST"] = saved_list if split_stock_list(saved_list) else ""
+                        config = Config.get_instance()
+                        config.refresh_stock_list()
+                    else:
+                        Config.reset_instance()
+                        self._reload_runtime_singletons()
+                        setup_env(override=True)
+                        config = Config.get_instance()
+                    warnings.extend(config.validate())
+                    reload_triggered = True
+                except Exception as exc:  # pragma: no cover - defensive branch
+                    logger.error("Configuration reload failed: %s", exc, exc_info=True)
+                    warnings.append("Configuration updated but reload failed")
 
         warnings.extend(
             self._build_explainability_warnings(
@@ -2407,6 +2508,86 @@ class SystemConfigService:
             or bool(cls._GENERATION_BACKEND_STATUS_LLM_CHANNEL_RE.fullmatch(normalized))
         )
 
+    # Keys that decide whether ask-stock is served over LiteLLM at all.
+    _AGENT_LLM_ROUTE_KEYS = ("AGENT_BACKEND", "AGENT_GENERATION_BACKEND")
+    # Keys that switch regular stock analysis into Agent mode. See
+    # src/core/pipeline.py, which reads config.agent_mode and config.agent_skills.
+    _AGENT_ANALYSIS_KEYS = ("AGENT_MODE", "AGENT_SKILLS")
+
+    @classmethod
+    def _update_activates_agent_path(
+        cls,
+        effective_map: Dict[str, str],
+        updated_keys: Set[str],
+    ) -> bool:
+        """Whether this update turns an Agent path on that reads the LLM graph.
+
+        There are two independent entries, and both resolve their model through
+        the LLM channel graph, so both have to be validated like any other
+        model-affecting change:
+
+        - Ask-stock over LiteLLM, decided by AGENT_BACKEND /
+          AGENT_GENERATION_BACKEND.
+        - Regular stock analysis in Agent mode, decided by AGENT_MODE or by
+          AGENT_SKILLS naming something other than "all". That path goes through
+          build_agent_executor and LLMToolAdapter directly and is not governed by
+          AGENT_BACKEND, so it needs its own check.
+
+        Without this, a save that only flips one of those keys can activate a
+        model dependency that is already broken: the save succeeds, the path
+        switches, and the analysis then fails with no error at save time.
+
+        Updates that do not activate these paths stay exempt from LLM checks.
+        Explicit retired backend values are still rejected by field validation;
+        an existing retired value does not block an unrelated partial save.
+        """
+        if cls._update_activates_litellm_agent(effective_map, updated_keys):
+            return True
+        if not any(key in updated_keys for key in cls._AGENT_ANALYSIS_KEYS):
+            return False
+        # Mirror the runtime parsing exactly so the gate cannot disagree with
+        # what the pipeline will actually do.
+        if "AGENT_MODE" in updated_keys:
+            if str(effective_map.get("AGENT_MODE") or "").strip().lower() == "true":
+                return True
+        if "AGENT_SKILLS" in updated_keys:
+            skills = [
+                part.strip()
+                for part in str(effective_map.get("AGENT_SKILLS") or "").split(",")
+                if part.strip()
+            ]
+            if skills and skills != ["all"]:
+                return True
+        return False
+
+    @classmethod
+    def _update_activates_litellm_agent(
+        cls,
+        effective_map: Dict[str, str],
+        updated_keys: Set[str],
+    ) -> bool:
+        """Whether this update turns the LiteLLM ask-stock path on.
+
+        Ask-stock over LiteLLM resolves its model through the LLM channel graph,
+        so switching to it has to be validated like any other model-affecting
+        change -- otherwise a save that only flips the backend can activate a
+        model dependency that is already broken, and ask-stock stops working
+        with no error at save time.
+
+        An unchanged retired chat backend does not activate the LiteLLM path.
+        Attempts to explicitly save that backend are rejected independently by
+        field validation, even when this graph check is skipped.
+        """
+        if not any(key in updated_keys for key in cls._AGENT_LLM_ROUTE_KEYS):
+            return False
+        chat_backend = str(effective_map.get("AGENT_BACKEND") or "auto").strip().lower()
+        if chat_backend not in {"auto", "litellm"}:
+            return False
+        generation_backend = str(
+            effective_map.get("AGENT_GENERATION_BACKEND") or "auto"
+        ).strip().lower()
+        return generation_backend in {"auto", "litellm"}
+
     @classmethod
     def _filter_generation_backend_items(
         cls,
@@ -2482,7 +2663,7 @@ class SystemConfigService:
             return []
         if SystemConfigService._collect_llm_channel_models_from_map(effective_map):
             return []
-        if (effective_map.get("LLM_CHANNELS") or "").strip():
+        if resolve_llm_channel_names(effective_map):
             return []
 
         issues: List[Dict[str, Any]] = []
@@ -2545,6 +2726,14 @@ class SystemConfigService:
         data_type = field_schema.get("data_type", "string")
         validation = field_schema.get("validation", {}) or {}
         is_required = field_schema.get("is_required", False)
+
+        if key == "AGENT_BACKEND" and value.strip().lower() == "codex_app_server":
+            from src.config import AGENT_BACKEND_REMOVED_MESSAGE
+
+            return [{
+                "key": key, "code": "backend_removed", "message": AGENT_BACKEND_REMOVED_MESSAGE,
+                "severity": "error", "expected": "auto or litellm", "actual": value,
+            }]
 
         # Empty values are valid for non-required fields (skip type validation)
         if not value.strip() and not is_required:
@@ -3385,7 +3574,7 @@ class SystemConfigService:
     def _anspire_legacy_llm_enabled(cls, effective_map: Dict[str, str]) -> bool:
         if not parse_env_bool(effective_map.get("ANSPIRE_LLM_ENABLED"), default=True):
             return False
-        for name in cls._split_csv(effective_map.get("LLM_CHANNELS") or ""):
+        for name in cls._split_csv(resolve_llm_channel_names(effective_map)):
             if name.strip().lower() != "anspire":
                 continue
             enabled_raw = effective_map.get("LLM_ANSPIRE_ENABLED")
@@ -3434,7 +3623,7 @@ class SystemConfigService:
     def _collect_setup_channel_models(cls, effective_map: Dict[str, str]) -> List[str]:
         models: List[str] = []
         seen: Set[str] = set()
-        for raw_name in cls._split_csv(effective_map.get("LLM_CHANNELS") or ""):
+        for raw_name in cls._split_csv(resolve_llm_channel_names(effective_map)):
             name = raw_name.strip()
             if not name:
                 continue
@@ -3446,7 +3635,7 @@ class SystemConfigService:
             if not enabled:
                 continue
 
-            base_url = (effective_map.get(f"{prefix}_BASE_URL") or "").strip()
+            base_url = resolve_llm_channel_base_url(name, effective_map.get(f"{prefix}_BASE_URL"))
             if name.lower() == "anspire" and not base_url:
                 base_url = (
                     effective_map.get("ANSPIRE_LLM_BASE_URL")
@@ -3464,7 +3653,13 @@ class SystemConfigService:
             )
             if name.lower() == "anspire" and not api_key:
                 api_key = (effective_map.get("ANSPIRE_API_KEYS") or "").strip()
+            api_key = ','.join(resolve_llm_channel_api_keys(name, cls._split_csv(api_key), effective_map))
             raw_models = cls._split_csv(effective_map.get(f"{prefix}_MODELS") or "")
+            raw_models = resolve_llm_channel_models(
+                name, raw_models, channel_names=resolve_llm_channel_names(effective_map),
+                primary_model=effective_map.get("LITELLM_MODEL") or "",
+                fallback_models=effective_map.get("LITELLM_FALLBACK_MODELS") or "",
+            )
             if name.lower() == "anspire" and not raw_models:
                 raw_models = [
                     (
@@ -3518,15 +3713,15 @@ class SystemConfigService:
     @classmethod
     def _infer_setup_legacy_primary_model(cls, effective_map: Dict[str, str]) -> str:
         if cls._has_any_config_value(effective_map, ("GEMINI_API_KEYS", "GEMINI_API_KEY")):
-            model = (effective_map.get("GEMINI_MODEL") or "gemini-3.1-pro-preview").strip()
+            model = (effective_map.get("GEMINI_MODEL") or "gemini-3.6-flash").strip()
             return model if "/" in model else f"gemini/{model}"
         if cls._has_any_config_value(effective_map, ("ANTHROPIC_API_KEYS", "ANTHROPIC_API_KEY")):
             model = (effective_map.get("ANTHROPIC_MODEL") or "claude-sonnet-4-6").strip()
             return model if "/" in model else f"anthropic/{model}"
         if cls._has_any_config_value(effective_map, ("DEEPSEEK_API_KEYS", "DEEPSEEK_API_KEY")):
-            return "deepseek/deepseek-chat"
+            return "deepseek/deepseek-v4-flash"
         if cls._has_any_config_value(effective_map, ("OPENAI_API_KEYS", "OPENAI_API_KEY", "AIHUBMIX_KEY")):
-            model = (effective_map.get("OPENAI_MODEL") or "gpt-5.5").strip()
+            model = (effective_map.get("OPENAI_MODEL") or "gpt-6.1-sol").strip()
             return model if "/" in model else f"openai/{model}"
         if (
             cls._anspire_legacy_llm_enabled(effective_map)
@@ -3868,13 +4063,73 @@ class SystemConfigService:
         )
 
     def _build_setup_storage_check(self, effective_map: Dict[str, str]) -> Dict[str, Any]:
-        db_path = Path((effective_map.get("DATABASE_PATH") or "./data/stock_analysis.db").strip()).expanduser()
+        raw_db_path = (effective_map.get("DATABASE_PATH") or "./data/stock_analysis.db").strip()
+        db_path = Path(raw_db_path).expanduser()
         parent = db_path.parent if db_path.parent != Path("") else Path(".")
-        probe = parent
-        while not probe.exists() and probe != probe.parent:
-            probe = probe.parent
 
-        if not probe.exists() or not probe.is_dir():
+        try:
+            if db_path.is_symlink() and not db_path.exists():
+                return self._setup_check(
+                    "storage",
+                    "数据库 / 本地存储",
+                    "system",
+                    True,
+                    "needs_action",
+                    f"数据库路径软链接无效: {db_path}",
+                    "请将 DATABASE_PATH 设置为可用的 SQLite 文件路径。",
+                )
+            if db_path.exists():
+                if db_path.is_dir() or not db_path.is_file():
+                    return self._setup_check(
+                        "storage",
+                        "数据库 / 本地存储",
+                        "system",
+                        True,
+                        "needs_action",
+                        f"数据库路径指向目录或非常规文件: {db_path}",
+                        "请将 DATABASE_PATH 设置为具体 SQLite 文件路径（如 ./data/stock_analysis.db）。",
+                    )
+                if not check_database_path_usable(str(db_path)):
+                    return self._setup_check(
+                        "storage",
+                        "数据库 / 本地存储",
+                        "system",
+                        True,
+                        "needs_action",
+                        f"数据库文件或所在目录不可写: {db_path}",
+                        "请调整 DATABASE_PATH 或目录权限。",
+                    )
+                return self._setup_check(
+                    "storage",
+                    "数据库 / 本地存储",
+                    "system",
+                    True,
+                    "configured",
+                    f"数据库路径可用: {db_path}",
+                )
+        except OSError as exc:
+            return self._setup_check(
+                "storage",
+                "数据库 / 本地存储",
+                "system",
+                True,
+                "needs_action",
+                f"数据库路径检查失败: {exc}",
+                "请检查 DATABASE_PATH 或上级目录权限。",
+            )
+
+        writable, probe = _inspect_dir_writable(str(parent))
+        if not writable:
+            if probe is not None and probe.exists() and probe.is_dir():
+                return self._setup_check(
+                    "storage",
+                    "数据库 / 本地存储",
+                    "system",
+                    True,
+                    "needs_action",
+                    f"数据库路径上级目录不可写: {probe}",
+                    "请调整 DATABASE_PATH 或目录权限。",
+                )
             return self._setup_check(
                 "storage",
                 "数据库 / 本地存储",
@@ -3885,27 +4140,14 @@ class SystemConfigService:
                 "请检查 DATABASE_PATH 或上级目录权限。",
             )
 
-        if os.access(probe, os.W_OK):
-            detail = f"数据库路径可用: {db_path}"
-            if not parent.exists():
-                detail = f"数据库上级目录可创建: {parent}"
-            return self._setup_check(
-                "storage",
-                "数据库 / 本地存储",
-                "system",
-                True,
-                "configured",
-                detail,
-            )
-
+        detail = f"数据库路径可用: {db_path}" if parent.exists() else f"数据库上级目录可创建: {parent}"
         return self._setup_check(
             "storage",
             "数据库 / 本地存储",
             "system",
             True,
-            "needs_action",
-            f"数据库路径上级目录不可写: {probe}",
-            "请调整 DATABASE_PATH 或目录权限。",
+            "configured",
+            detail,
         )
 
     @staticmethod
@@ -4481,41 +4723,6 @@ class SystemConfigService:
         """Validate dependencies across multiple keys."""
         issues: List[Dict[str, Any]] = []
 
-        agent_backend = (effective_map.get("AGENT_BACKEND") or "auto").strip().lower()
-        agent_arch = (effective_map.get("AGENT_ARCH") or "single").strip().lower()
-        if agent_backend == "codex_app_server" and agent_arch != "single" and (
-            {"AGENT_BACKEND", "AGENT_ARCH"} & updated_keys
-        ):
-            issues.append(
-                {
-                    "key": "AGENT_ARCH",
-                    "code": "unsupported_agent_arch",
-                    "message": "Codex 本地 Agent 当前只支持单 Agent 问股，请切换为 single。",
-                    "severity": "error",
-                    "expected": "single",
-                    "actual": agent_arch,
-                }
-            )
-
-        timeout_raw = (effective_map.get("AGENT_ORCHESTRATOR_TIMEOUT_S") or "600").strip()
-        try:
-            agent_timeout = int(timeout_raw)
-        except ValueError:
-            agent_timeout = None
-        if agent_backend == "codex_app_server" and agent_timeout is not None and agent_timeout <= 0 and (
-            {"AGENT_BACKEND", "AGENT_ORCHESTRATOR_TIMEOUT_S"} & updated_keys
-        ):
-            issues.append(
-                {
-                    "key": "AGENT_ORCHESTRATOR_TIMEOUT_S",
-                    "code": "codex_timeout_required",
-                    "message": "Codex 本地 Agent 必须设置大于 0 的整体时限，确保每次问股都会结束。",
-                    "severity": "error",
-                    "expected": ">0 when AGENT_BACKEND=codex_app_server",
-                    "actual": timeout_raw,
-                }
-            )
-
         token_value = (effective_map.get("TELEGRAM_BOT_TOKEN") or "").strip()
         chat_id_value = (effective_map.get("TELEGRAM_CHAT_ID") or "").strip()
         if token_value and not chat_id_value and (
@@ -4589,13 +4796,24 @@ class SystemConfigService:
                 }
             )
 
-        issues.extend(
-            SystemConfigService._validate_llm_channel_map(
-                effective_map=effective_map,
-                updated_keys=updated_keys,
+        # A partial update must not be blocked by existing, unrelated LLM
+        # errors. Empty input remains a full LLM check for status diagnostics.
+        if (
+            not updated_keys
+            or SystemConfigService._update_activates_agent_path(effective_map, updated_keys)
+            or any(
+                SystemConfigService._is_generation_backend_status_key(key)
+                or key in {"AGENT_LITELLM_MODEL", "VISION_MODEL"}
+                for key in updated_keys
             )
-        )
-        issues.extend(SystemConfigService._validate_llm_runtime_selection(effective_map=effective_map))
+        ):
+            issues.extend(
+                SystemConfigService._validate_llm_channel_map(
+                    effective_map=effective_map,
+                    updated_keys=updated_keys,
+                )
+            )
+            issues.extend(SystemConfigService._validate_llm_runtime_selection(effective_map=effective_map))
 
         if parse_env_bool(effective_map.get("NOTIFICATION_DAILY_DIGEST_ENABLED"), default=False):
             issues.append(
@@ -4621,7 +4839,7 @@ class SystemConfigService:
         if SystemConfigService._uses_litellm_yaml(effective_map):
             return issues
 
-        raw_channels = (effective_map.get("LLM_CHANNELS") or "").strip()
+        raw_channels = resolve_llm_channel_names(effective_map)
         if not raw_channels:
             return issues
 
@@ -4668,7 +4886,7 @@ class SystemConfigService:
             api_surface_value = (effective_map.get(f"{prefix}_API_SURFACE") or "").strip()
             if name.lower() == "anspire" and not protocol_value:
                 protocol_value = "openai"
-            base_url_value = (effective_map.get(f"{prefix}_BASE_URL") or "").strip()
+            base_url_value = resolve_llm_channel_base_url(name, effective_map.get(f"{prefix}_BASE_URL"))
             if name.lower() == "anspire" and not base_url_value:
                 base_url_value = (
                     effective_map.get("ANSPIRE_LLM_BASE_URL")
@@ -4680,11 +4898,19 @@ class SystemConfigService:
             )
             if name.lower() == "anspire" and not api_key_value:
                 api_key_value = (effective_map.get("ANSPIRE_API_KEYS") or "").strip()
+            api_key_value = ','.join(resolve_llm_channel_api_keys(
+                name, SystemConfigService._split_csv(api_key_value), effective_map,
+            ))
             models_value = [
                 model.strip()
                 for model in (effective_map.get(f"{prefix}_MODELS") or "").split(",")
                 if model.strip()
             ]
+            models_value = resolve_llm_channel_models(
+                name, models_value, channel_names=resolve_llm_channel_names(effective_map),
+                primary_model=effective_map.get("LITELLM_MODEL") or "",
+                fallback_models=effective_map.get("LITELLM_FALLBACK_MODELS") or "",
+            )
             if name.lower() == "anspire" and not models_value:
                 models_value = [
                     (
@@ -4799,7 +5025,7 @@ class SystemConfigService:
     @staticmethod
     def _collect_llm_channel_models_from_map(effective_map: Dict[str, str]) -> List[str]:
         """Collect normalized model names from channel-style env values."""
-        raw_channels = (effective_map.get("LLM_CHANNELS") or "").strip()
+        raw_channels = resolve_llm_channel_names(effective_map)
         if not raw_channels:
             return []
 
@@ -4818,7 +5044,7 @@ class SystemConfigService:
             if not enabled:
                 continue
 
-            base_url_value = (effective_map.get(f"{prefix}_BASE_URL") or "").strip()
+            base_url_value = resolve_llm_channel_base_url(name, effective_map.get(f"{prefix}_BASE_URL"))
             if name.lower() == "anspire" and not base_url_value:
                 base_url_value = (
                     effective_map.get("ANSPIRE_LLM_BASE_URL")
@@ -4833,6 +5059,11 @@ class SystemConfigService:
                 for model in (effective_map.get(f"{prefix}_MODELS") or "").split(",")
                 if model.strip()
             ]
+            raw_models = resolve_llm_channel_models(
+                name, raw_models, channel_names=resolve_llm_channel_names(effective_map),
+                primary_model=effective_map.get("LITELLM_MODEL") or "",
+                fallback_models=effective_map.get("LITELLM_FALLBACK_MODELS") or "",
+            )
             if name.lower() == "anspire" and not raw_models:
                 raw_models = [
                     (
@@ -4884,7 +5115,7 @@ class SystemConfigService:
     @staticmethod
     def _collect_hermes_channel_models_from_map(effective_map: Dict[str, str]) -> List[str]:
         """Collect valid reserved Hermes route aliases from channel-style env values."""
-        raw_channels = (effective_map.get("LLM_CHANNELS") or "").strip()
+        raw_channels = resolve_llm_channel_names(effective_map)
         if not raw_channels:
             return []
 
@@ -4926,7 +5157,7 @@ class SystemConfigService:
     @staticmethod
     def _collect_non_hermes_channel_models_from_map(effective_map: Dict[str, str]) -> List[str]:
         """Collect enabled non-Hermes channel route aliases from channel-style env values."""
-        raw_channels = (effective_map.get("LLM_CHANNELS") or "").strip()
+        raw_channels = resolve_llm_channel_names(effective_map)
         if not raw_channels:
             return []
         models: List[str] = []
@@ -4941,7 +5172,7 @@ class SystemConfigService:
                 enabled_raw = effective_map.get("ANSPIRE_LLM_ENABLED")
             if not parse_env_bool(enabled_raw, default=True):
                 continue
-            base_url_value = (effective_map.get(f"{prefix}_BASE_URL") or "").strip()
+            base_url_value = resolve_llm_channel_base_url(name, effective_map.get(f"{prefix}_BASE_URL"))
             if name.lower() == "anspire" and not base_url_value:
                 base_url_value = (
                     effective_map.get("ANSPIRE_LLM_BASE_URL")
@@ -4954,6 +5185,11 @@ class SystemConfigService:
             if not is_supported_llm_channel_api_surface_value(api_surface_value):
                 continue
             raw_models = SystemConfigService._split_csv(effective_map.get(f"{prefix}_MODELS") or "")
+            raw_models = resolve_llm_channel_models(
+                name, raw_models, channel_names=resolve_llm_channel_names(effective_map),
+                primary_model=effective_map.get("LITELLM_MODEL") or "",
+                fallback_models=effective_map.get("LITELLM_FALLBACK_MODELS") or "",
+            )
             if name.lower() == "anspire" and not raw_models:
                 raw_models = [
                     (
@@ -5000,11 +5236,11 @@ class SystemConfigService:
 
     @staticmethod
     def _uses_litellm_yaml(effective_map: Dict[str, str]) -> bool:
-        """Return True when a valid LiteLLM YAML config takes precedence over channels."""
+        """Return True when a usable LiteLLM YAML route takes precedence over channels."""
         config_path = (effective_map.get("LITELLM_CONFIG") or "").strip()
         if not config_path:
             return False
-        return bool(Config._parse_litellm_yaml(config_path))
+        return bool(get_configured_llm_models(Config._parse_litellm_yaml(config_path)))
 
     @staticmethod
     def _collect_yaml_models_from_map(effective_map: Dict[str, str]) -> List[str]:
@@ -5066,7 +5302,7 @@ class SystemConfigService:
         hermes_route_set = set(SystemConfigService._collect_hermes_channel_models_from_map(effective_map))
         mixed_hermes_routes = SystemConfigService._collect_mixed_hermes_routes_from_map(effective_map)
         if not available_model_set:
-            raw_channels = (effective_map.get("LLM_CHANNELS") or "").strip()
+            raw_channels = resolve_llm_channel_names(effective_map)
             if not raw_channels:
                 return issues
 

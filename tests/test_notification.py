@@ -14,6 +14,7 @@ TODO:
     - 生成日报
 2. 添加 send_to_context 的测试
 """
+import json
 import os
 import sys
 import unittest
@@ -713,6 +714,57 @@ class TestNotificationServiceSendToMethods(unittest.TestCase):
 class TestNotificationServiceReportGeneration(unittest.TestCase):
     """报告生成与选路相关测试。"""
 
+    @staticmethod
+    def _source_result(
+        code: str,
+        name: str,
+        score: int,
+        data_sources: Optional[str],
+    ) -> AnalysisResult:
+        result = AnalysisResult(
+            code=code,
+            name=name,
+            sentiment_score=score,
+            trend_prediction="震荡",
+            operation_advice="观望",
+            analysis_summary=f"{name} summary",
+            report_language="zh",
+            data_sources=data_sources or "",
+        )
+        if data_sources is None:
+            setattr(result, "data_sources", None)
+        return result
+
+    @mock.patch("src.notification.get_config")
+    def test_market_snapshot_source_names_in_report_renderers(self, mock_get_config):
+        """Known sources without Korean names must not abort report generation."""
+        mock_get_config.return_value = _make_config(report_renderer_enabled=False)
+        service = NotificationService()
+        renderers = {
+            "daily": lambda result: service.generate_daily_report([result]),
+            "dashboard": lambda result: service.generate_dashboard_report([result]),
+            "single_stock": service.generate_single_stock_report,
+        }
+        for source, names in service._SOURCE_DISPLAY_NAMES.items():
+            for language, expected in (("zh", names["zh"]), ("en", names["en"]), ("ko", names["en"])):
+                result = self._source_result("AAPL", "Apple", 50, source)
+                result.report_language = language
+                result.market_snapshot = {"price": 100, "source": source}
+                for renderer, render in renderers.items():
+                    with self.subTest(source=source, language=language, renderer=renderer):
+                        self.assertIn(f"| {expected} |", render(result))
+
+    @mock.patch("src.notification.get_config")
+    def test_market_snapshot_unknown_source_is_preserved(self, mock_get_config):
+        mock_get_config.return_value = _make_config(report_renderer_enabled=False)
+        service = NotificationService()
+        for source, expected in (("custom_source", "custom_source"), (None, "N/A")):
+            result = self._source_result("AAPL", "Apple", 50, source)
+            result.report_language = "ko"
+            result.market_snapshot = {"price": 100, "source": source}
+            with self.subTest(source=source):
+                self.assertIn(f"| {expected} |", service.generate_single_stock_report(result))
+
     def test_signal_metadata_uses_resolved_eight_state_action(self):
         service = NotificationService()
         cases = [
@@ -823,6 +875,200 @@ class TestNotificationServiceReportGeneration(unittest.TestCase):
 
         self.assertEqual(mock_dashboard.call_count, 3)
         mock_brief.assert_called_once()
+
+    @mock.patch("src.notification.get_config")
+    def test_dashboard_sources_are_isolated_in_builtin_and_template_renderers(
+        self, mock_get_config: mock.MagicMock
+    ):
+        alpha = self._source_result("AAA", "Alpha", 80, "agent:a,daily:AlphaFetcher")
+        empty = self._source_result("NONE", "NoSource", 70, None)
+        beta = self._source_result("BBB", "Beta", 60, "agent:b,daily:BetaFetcher")
+
+        for renderer_enabled in (False, True):
+            with self.subTest(renderer_enabled=renderer_enabled):
+                mock_get_config.return_value = _make_config(
+                    report_renderer_enabled=renderer_enabled
+                )
+                service = NotificationService()
+                out = service.generate_dashboard_report(
+                    [beta, empty, alpha], report_date="2026-08-27"
+                )
+
+                alpha_start = out.index("Alpha (AAA)")
+                empty_start = out.index("NoSource (NONE)")
+                beta_start = out.index("Beta (BBB)")
+                alpha_block = out[alpha_start:empty_start]
+                empty_block = out[empty_start:beta_start]
+                beta_block = out[beta_start:]
+
+                self.assertIn("agent:a,daily:AlphaFetcher", alpha_block)
+                self.assertNotIn("daily:BetaFetcher", alpha_block)
+                self.assertNotIn("数据来源", empty_block)
+                self.assertIn("agent:b,daily:BetaFetcher", beta_block)
+                self.assertNotIn("daily:AlphaFetcher", beta_block)
+                self.assertEqual(out.count("agent:a,daily:AlphaFetcher"), 1)
+                self.assertEqual(out.count("agent:b,daily:BetaFetcher"), 1)
+                if not renderer_enabled:
+                    self.assertIn(
+                        "agent:a,daily:AlphaFetcher*\n\n---",
+                        alpha_block,
+                    )
+
+    @mock.patch("src.notification.get_config")
+    def test_brief_sources_are_isolated_in_builtin_and_template_renderers(
+        self, mock_get_config: mock.MagicMock
+    ):
+        alpha = self._source_result("AAA", "Alpha", 80, "daily:AlphaFetcher")
+        empty = self._source_result("NONE", "NoSource", 70, "")
+        beta = self._source_result("BBB", "Beta", 60, "daily:BetaFetcher")
+
+        for renderer_enabled in (False, True):
+            with self.subTest(renderer_enabled=renderer_enabled):
+                mock_get_config.return_value = _make_config(
+                    report_renderer_enabled=renderer_enabled
+                )
+                service = NotificationService()
+                out = service.generate_brief_report(
+                    [beta, empty, alpha], report_date="2026-08-27"
+                )
+
+                alpha_start = out.index("**Alpha(AAA)**")
+                empty_start = out.index("**NoSource(NONE)**")
+                beta_start = out.index("**Beta(BBB)**")
+                alpha_block = out[alpha_start:empty_start]
+                empty_block = out[empty_start:beta_start]
+                beta_block = out[beta_start:]
+
+                self.assertIn("daily:AlphaFetcher", alpha_block)
+                self.assertNotIn("daily:BetaFetcher", alpha_block)
+                self.assertNotIn("数据来源", empty_block)
+                self.assertIn("daily:BetaFetcher", beta_block)
+                self.assertNotIn("daily:AlphaFetcher", beta_block)
+                self.assertEqual(out.count("daily:AlphaFetcher"), 1)
+                self.assertEqual(out.count("daily:BetaFetcher"), 1)
+
+    @mock.patch("src.notification.get_config")
+    def test_dashboard_summary_only_keeps_sources_without_restoring_details(
+        self, mock_get_config: mock.MagicMock
+    ):
+        result = self._source_result("AAA", "Alpha", 80, "daily:AlphaFetcher")
+        result.dashboard = {
+            "core_conclusion": {"one_sentence": "summary-only conclusion"},
+            "battle_plan": {"entry_plan": "detail-only plan"},
+        }
+
+        for renderer_enabled in (False, True):
+            with self.subTest(renderer_enabled=renderer_enabled):
+                mock_get_config.return_value = _make_config(
+                    report_renderer_enabled=renderer_enabled
+                )
+                service = NotificationService()
+                service._report_summary_only = True
+                out = service.generate_dashboard_report(
+                    [result], report_date="2026-08-27"
+                )
+
+                self.assertEqual(out.count("daily:AlphaFetcher"), 1)
+                self.assertNotIn("核心结论", out)
+                self.assertNotIn("detail-only plan", out)
+
+    @mock.patch("src.notification.get_config")
+    def test_empty_template_output_falls_back_to_source_aware_reports(
+        self, mock_get_config: mock.MagicMock
+    ):
+        mock_get_config.return_value = _make_config(report_renderer_enabled=True)
+        result = self._source_result("AAA", "Alpha", 80, "daily:AlphaFetcher")
+        service = NotificationService()
+
+        with mock.patch("src.services.report_renderer.render", return_value=None) as render:
+            dashboard = service.generate_dashboard_report(
+                [result], report_date="2026-08-27"
+            )
+            brief = service.generate_brief_report([result], report_date="2026-08-27")
+
+        self.assertEqual(render.call_count, 2)
+        self.assertEqual(dashboard.count("daily:AlphaFetcher"), 1)
+        self.assertEqual(brief.count("daily:AlphaFetcher"), 1)
+        self.assertIn("*📋 数据来源：daily:AlphaFetcher*", dashboard)
+        self.assertIn("*📋 数据来源：daily:AlphaFetcher*", brief)
+
+    @mock.patch("src.notification.get_config")
+    def test_source_labels_render_in_all_supported_languages(
+        self, mock_get_config: mock.MagicMock
+    ):
+        labels_by_language = {
+            "zh": "数据来源",
+            "en": "Data Sources",
+            "ko": "데이터 출처",
+        }
+        for language, expected_label in labels_by_language.items():
+            for renderer_enabled in (False, True):
+                for report_type in ("simple", "brief"):
+                    with self.subTest(
+                        language=language,
+                        renderer_enabled=renderer_enabled,
+                        report_type=report_type,
+                    ):
+                        mock_get_config.return_value = _make_config(
+                            report_renderer_enabled=renderer_enabled
+                        )
+                        service = NotificationService()
+                        result = self._source_result(
+                            "AAA", "Alpha", 80, "daily:AlphaFetcher"
+                        )
+                        result.report_language = language
+
+                        out = service.generate_aggregate_report(
+                            [result], report_type, report_date="2026-08-27"
+                        )
+
+                        self.assertIn(
+                            f"*📋 {expected_label}：daily:AlphaFetcher*",
+                            out,
+                        )
+
+    @mock.patch("src.notification.get_config")
+    def test_reports_omit_source_label_when_data_sources_are_missing(
+        self, mock_get_config: mock.MagicMock
+    ):
+        for data_sources in (None, "", "   "):
+            for renderer_enabled in (False, True):
+                for report_type in ("simple", "brief"):
+                    with self.subTest(
+                        data_sources=data_sources,
+                        renderer_enabled=renderer_enabled,
+                        report_type=report_type,
+                    ):
+                        mock_get_config.return_value = _make_config(
+                            report_renderer_enabled=renderer_enabled
+                        )
+                        service = NotificationService()
+                        result = self._source_result(
+                            "AAA", "Alpha", 80, data_sources
+                        )
+
+                        out = service.generate_aggregate_report(
+                            [result], report_type, report_date="2026-08-27"
+                        )
+
+                        self.assertNotIn("数据来源", out)
+
+    @mock.patch("src.notification.get_config")
+    def test_generate_daily_report_keeps_existing_source_line(
+        self, mock_get_config: mock.MagicMock
+    ):
+        mock_get_config.return_value = _make_config(report_renderer_enabled=False)
+        service = NotificationService()
+        result = self._source_result(
+            "AAA", "Alpha", 80, "agent:a,daily:AlphaFetcher"
+        )
+
+        out = service.generate_daily_report([result], report_date="2026-08-27")
+
+        self.assertEqual(
+            out.count("*📋 数据来源：agent:a,daily:AlphaFetcher*"),
+            1,
+        )
 
     @mock.patch("src.notification.get_config")
     def test_generate_single_stock_report_keeps_legacy_simple_format(self, mock_get_config: mock.MagicMock):
@@ -2258,7 +2504,35 @@ class TestNotificationServiceReportGeneration(unittest.TestCase):
         self.assertTrue(ok)
         mock_post.assert_called_once()
         self.assertEqual(mock_post.call_args.args[0], "https://ntfy.sh")
-        self.assertEqual(mock_post.call_args.kwargs["json"]["topic"], "dsa-topic")
+        self.assertEqual(
+            json.loads(mock_post.call_args.kwargs["data"].decode("utf-8"))["topic"],
+            "dsa-topic",
+        )
+
+    @mock.patch("src.notification_sender.ntfy_sender.time.sleep")
+    @mock.patch("src.notification.get_config")
+    @mock.patch("requests.post")
+    def test_send_long_report_to_ntfy_is_split_via_notification_service(
+        self,
+        mock_post: mock.MagicMock,
+        mock_get_config: mock.MagicMock,
+        _mock_sleep: mock.MagicMock,
+    ):
+        mock_get_config.return_value = _make_config(ntfy_url="https://ntfy.sh/dsa-topic")
+        mock_post.return_value = _make_response(200)
+        report = "\n\n---\n\n".join(
+            f"## 股票 {index}\n\n" + "中文分析正文。" * 120 for index in range(1, 7)
+        )
+
+        ok = NotificationService().send(report)
+
+        self.assertTrue(ok)
+        self.assertGreaterEqual(mock_post.call_count, 2)
+        for call in mock_post.call_args_list:
+            body = call.kwargs["data"]
+            self.assertLessEqual(len(body), 8192)
+            message = json.loads(body.decode("utf-8"))["message"]
+            self.assertLess(len(message.encode("utf-8")), 4096)
 
     @mock.patch("src.notification.get_config")
     def test_ntfy_url_without_topic_is_not_available(self, mock_get_config: mock.MagicMock):
@@ -2428,6 +2702,23 @@ class TestNotificationServiceReportGeneration(unittest.TestCase):
 
         self.assertTrue(ok)
         mock_post.assert_called_once()
+
+    @mock.patch("src.notification_sender.telegram_sender.time.sleep")
+    @mock.patch("src.notification.get_config")
+    @mock.patch("requests.post")
+    def test_send_to_telegram_via_notification_service_respects_flood_control(
+        self, mock_post, mock_get_config, mock_sleep
+    ):
+        mock_get_config.return_value = _make_config(telegram_bot_token="TOKEN", telegram_chat_id="123")
+        limited = requests.Response()
+        limited.status_code = 429
+        limited._content = b'{"ok": false, "parameters": {"retry_after": 37}}'
+        mock_post.side_effect = [limited, _make_response(200, {"ok": True})]
+
+        self.assertTrue(NotificationService().send("hello telegram"))
+
+        mock_sleep.assert_called_once_with(37)
+        self.assertEqual(mock_post.call_count, 2)
 
     @mock.patch("src.notification.get_config")
     @mock.patch("requests.post")

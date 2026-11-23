@@ -103,7 +103,7 @@ const settingsHelpZhCN: SettingsHelpMap = {
   'settings.ai_model.LITELLM_MODEL': {
     title: '主模型',
     summary: '指定普通分析流程默认使用的 LLM 模型。',
-    usage: '推荐使用 provider/model 格式，例如 deepseek/deepseek-v4-flash、gemini/gemini-3.1-pro-preview 或 ollama/qwen3:8b。',
+    usage: '推荐使用 provider/model 格式，例如 deepseek/deepseek-v4-flash、gemini/gemini-3.6-flash 或 ollama/qwen3:8b。',
     valueNotes: [
       '系统配置优先级为 LITELLM_CONFIG > LLM_CHANNELS > legacy provider keys。',
       '如果留空，系统会尝试根据已配置的 API Key 或渠道声明自动推断。',
@@ -137,12 +137,12 @@ const settingsHelpZhCN: SettingsHelpMap = {
   'settings.ai_model.AGENT_LITELLM_MODEL': {
     title: 'Agent 主模型',
     summary: '为问股、策略 Agent 等 Agent 链路单独指定模型。',
-    usage: '使用 provider/model 格式。留空时继承普通分析主模型；裸模型名会按兼容逻辑归一到 openai/<model>。选择 Codex 本地 Agent 时保留该值，但 Codex 问股不使用它。',
+    usage: '使用 provider/model 格式。留空时继承普通分析主模型；裸模型名会按兼容逻辑归一到 openai/<model>。',
     valueNotes: [
       '适合给 Agent 使用推理能力更强或上下文更长的模型。',
       '该字段只影响 Agent 链路，不会改变普通个股分析的主模型。',
     ],
-    impact: ['影响默认模型问股、策略选择和相关工具调用；不影响 Codex 本地 Agent。'],
+    impact: ['影响默认模型问股、策略选择和相关工具调用。'],
     notes: ['请确认该模型存在于已启用渠道、YAML 路由或 legacy provider key 可达范围内。'],
   },
   'settings.ai_model.LITELLM_FALLBACK_MODELS': {
@@ -276,6 +276,30 @@ const settingsHelpZhCN: SettingsHelpMap = {
     impact: ['影响部分 A 股基础数据、股票列表和相关增强数据获取。'],
     notes: ['不要把 token 提交到仓库或公开日志。'],
   },
+  'settings.data_source.CROSS_ASSET_CONTEXT_ENABLED': {
+    title: 'Cross-Asset Context',
+    summary: '是否注入跨资产外围（指数/VIX/美债10Y）低敏上下文摘要，用于风险偏好校准。',
+    usage: '默认关闭（opt-in）；不配置时主分析流程零行为差异。显式开启后，数据源失败自动降级为 unknown 最小上下文，不中断主分析。',
+    valueNotes: ['仅注入低敏背景摘要做风险偏好校准，不直接生成买卖规则。'],
+    impact: ['开启后每次个股分析增加少量外部行情请求。'],
+    notes: ['关闭后分析不包含跨资产背景信息。'],
+  },
+  'settings.data_source.TICKPLUS_API_KEY': {
+    title: 'TickPlus API Key（推荐）',
+    summary: '首选推荐 A 股 / ETF 日 K、实时指标、名称查询；ETF 轮动使用前复权实例。',
+    usage: '在 TickPlus 控制台获取自己的 Key；未设置实时优先级时自动首选 tickplus。',
+    valueNotes: ['可选增强项，未配置时继续使用其他行情源。', '套餐额度、频率和 Key 有效期以平台确认为准。'],
+    impact: ['影响普通 A 股 / ETF 日 K、实时指标及 ETF 轮动，不改变已登记指数和海外市场路由。'],
+    notes: ['失败自动回退；不要公开测试 Key。已登记指数与海外市场保持原路由。'],
+  },
+  'settings.data_source.TICKPLUS_PRIORITY': {
+    title: 'TickPlus 日 K 优先级',
+    summary: '数字越小越优先，默认 0，同值先于内置源。',
+    usage: '仅影响普通 A 股 / ETF 日 K；实时行情由 REALTIME_SOURCE_PRIORITY 控制。',
+    valueNotes: ['填写非负整数；未配置 Key 时不启用 TickPlus。'],
+    impact: ['调整普通日 K 数据源的尝试顺序。'],
+    notes: ['显式设置的实时行情顺序会保留。'],
+  },
   'settings.data_source.TICKFLOW_API_KEY': {
     title: 'TickFlow API Key',
     summary: '用于启用 TickFlow A 股日 K、实时行情、股票列表/名称与大盘复盘增强数据。',
@@ -284,12 +308,28 @@ const settingsHelpZhCN: SettingsHelpMap = {
     impact: ['影响 A 股日线回退链、实时行情、股票名称/列表与大盘复盘数据覆盖度。'],
     notes: ['不要在 issue、日志或截图中暴露真实 Key。'],
   },
+  'settings.data_source.MX_APIKEY': {
+    title: '妙想（MX_API）API Key',
+    summary: '用于启用妙想补充数据源：东财公开接口失败或被限流时，兜底获取筹码分布与个股资金流。',
+    usage: '在妙想 Skills 页面获取 API Key 后填入；未配置时系统行为完全不变。',
+    valueNotes: ['该 Key 是可选补充项，不参与日 K 主链路。'],
+    impact: ['影响筹码分布与个股资金流在东财接口异常时的可用性。'],
+    notes: ['不要在 issue、日志或截图中暴露真实 Key。'],
+  },
+  'settings.data_source.MX_PRIORITY': {
+    title: '妙想数据源优先级',
+    summary: '控制妙想补充数据源在数据源回退链中的位置。',
+    usage: '填写整数；数字越小越早尝试，默认 6。未配置 MX_APIKEY 时该优先级不会生效。',
+    valueNotes: ['该数据源不提供日 K 行情，优先级仅影响筹码分布/资金流的兜底顺序。'],
+    impact: ['影响补充数据块的兜底顺序。'],
+    notes: ['一般无需调整默认值。'],
+  },
   'settings.data_source.TICKFLOW_PRIORITY': {
     title: 'TickFlow 日 K 优先级',
-    summary: '控制 TickFlow 在 A 股日 K 数据源回退链中的位置。',
-    usage: '填写整数；数字越小越早尝试，默认 2。未配置 TICKFLOW_API_KEY 时该优先级不会生效。',
-    valueNotes: ['该设置只影响日 K 等通用数据源回退链，不控制实时行情源顺序。'],
-    impact: ['影响 A 股日 K 获取的数据源尝试顺序；实时行情仍由 REALTIME_SOURCE_PRIORITY 单独决定。'],
+    summary: '控制 TickFlow 在普通 A 股日 K 数据源回退链中的位置。',
+    usage: '填写整数；数字越小越早尝试，默认 2。未配置 TICKFLOW_API_KEY 时该优先级不会生效；已登记指数固定按 Tencent → AkShare → TickFlow → YFinance 降级，不读取本配置。',
+    valueNotes: ['该设置只影响普通 A 股日 K 等通用数据源回退链，不控制已登记指数或实时行情源顺序。'],
+    impact: ['影响普通 A 股日 K 获取的数据源尝试顺序；已登记指数和实时行情均使用各自独立顺序。'],
     notes: ['如果希望优先使用 TickFlow 日 K，可以适当调低该值；如果希望实时行情优先使用 TickFlow，请在 REALTIME_SOURCE_PRIORITY 中显式加入 tickflow。'],
   },
   'settings.data_source.TICKFLOW_KLINE_ADJUST': {
@@ -326,10 +366,10 @@ const settingsHelpZhCN: SettingsHelpMap = {
   },
   'settings.base.SCREENING_ENABLED': {
     title: '选股',
-    summary: '控制是否启用选股页；实现参考 AlphaSift。',
-    usage: '默认关闭。设为 true 后显示选股入口并启用选股策略。',
+    summary: '控制是否启用选股策略；实现参考 AlphaSift。',
+    usage: '默认关闭。导航始终保留选股入口；设为 true 后可运行选股策略。',
     valueNotes: ['选股结果仅用于研究辅助，不构成投资建议。'],
-    impact: ['影响 Web 选股入口、策略读取和选股 API。'],
+    impact: ['影响策略读取和选股 API，不隐藏导航入口。'],
     notes: ['关闭时不影响原有分析、报告和通知流程。'],
   },
   'settings.data_source.REALTIME_SOURCE_PRIORITY': {
@@ -350,6 +390,30 @@ const settingsHelpZhCN: SettingsHelpMap = {
     ],
     impact: ['影响现价、技术指标、盘中分析和部分报告字段。'],
     notes: ['单一数据源失败应降级到后续数据源，不应拖垮主流程。'],
+  },
+  'settings.data_source.FUTU_OPEND_HOST': {
+    title: 'Futu OpenD 地址',
+    summary: '配置 Futu OpenD 服务地址。留空时不启用 Futu 数据源。',
+    usage: '填写 IPv4 地址或可解析到 IPv4 的主机名。',
+    valueNotes: ['OpenD 必须允许 DSA 容器访问。'],
+    impact: ['影响港股 Futu 实时行情、历史行情和基本面数据访问。'],
+    notes: ['这是服务地址，不是 Futu 账号密码。'],
+  },
+  'settings.data_source.FUTU_OPEND_PORT': {
+    title: 'Futu OpenD 端口',
+    summary: '配置 Futu OpenD TCP 端口。',
+    usage: '填写 1 到 65535 之间的端口，默认 11111。',
+    valueNotes: ['端口必须与 OpenD 实际监听端口一致。'],
+    impact: ['影响 DSA 与 Futu OpenD 的连接。'],
+    notes: ['修改后通常需要重启 DSA 服务以重新建立连接。'],
+  },
+  'settings.data_source.FUTU_HK_REALTIME_SOURCE_PRIORITY': {
+    title: 'Futu 港股实时数据源优先级',
+    summary: '配置港股实时行情的 Futu/Longbridge/AkShare/Yfinance 尝试顺序。',
+    usage: '使用英文逗号分隔，可选 futu、longbridge、akshare、yfinance。',
+    valueNotes: ['前面的数据源优先尝试；失败后自动回退。'],
+    impact: ['只影响港股实时行情，不改变 A 股实时数据源优先级。'],
+    notes: ['未配置 Futu OpenD 时会自动跳过 futu。'],
   },
   'settings.data_source.search_api_keys': {
     title: '搜索服务 API Key',
@@ -489,6 +553,56 @@ const settingsHelpZhCN: SettingsHelpMap = {
       '保存后通常需要重启相关 bot/服务进程，已运行的长连接不会自动重建。',
       '不要把 Stream 模式和群机器人 Webhook 混为一条配置路径。',
     ],
+  },
+  'settings.notification.WECOM_AIBOT_ENABLED': {
+    title: '企微智能机器人长连接',
+    summary: '启用企业微信智能机器人的 WebSocket 长连接模式（对话式机器人命令），与企业微信群 Webhook 推送通道相互独立。',
+    usage: '先在企业微信后台创建智能机器人，填写 WECOM_AIBOT_BOT_ID 和 WECOM_AIBOT_SECRET 后开启。',
+    valueNotes: [
+      'true 表示允许运行时通过官方长连接通道收发智能机器人消息。',
+      'false 表示不启用（默认）；现有企微群 Webhook 推送行为完全不变。',
+    ],
+    impact: [
+      '影响企微智能机器人的对话命令链路。',
+      '不会改变企业微信群机器人 Webhook 的推送路径。',
+    ],
+    notes: [
+      '长连接模式无需公网 IP；本系统不提供回调 URL 模式。',
+      '保存后需要重启相关 bot/服务进程才会建立长连接。',
+    ],
+  },
+  'settings.notification.WECOM_AIBOT_BOT_ID': {
+    title: '企微智能机器人 Bot ID',
+    summary: '企业微信智能机器人的 Bot ID，在企业微信后台获取；长连接模式必填。',
+    usage: '企业微信管理后台创建智能机器人后复制其 Bot ID，填入 WECOM_AIBOT_BOT_ID。',
+    valueNotes: [
+      '仅用于长连接认证（aibot_subscribe 帧），与群机器人 Webhook 的 key 无关。',
+      'WECOM_AIBOT_ENABLED=true 时必填，缺失时客户端不会启动。',
+    ],
+    impact: ['影响企微智能机器人长连接认证是否成功。'],
+    notes: ['非超管创建的机器人收到的用户 userid 为密文，属官方协议限制。'],
+  },
+  'settings.notification.WECOM_AIBOT_SECRET': {
+    title: '企微智能机器人 Secret',
+    summary: '智能机器人长连接专用 Secret，与群机器人 Webhook 的 Token/EncodingAESKey 是不同的凭据。',
+    usage: '在企业微信后台智能机器人详情中复制长连接 Secret，填入 WECOM_AIBOT_SECRET。',
+    valueNotes: [
+      '长连接专用凭据，不要与回调模式的 Token/EncodingAESKey 混用。',
+      '按密钥保护，泄露后请在企业微信后台重置。',
+    ],
+    impact: ['影响企微智能机器人长连接认证是否成功。'],
+    notes: ['保存后需要重启相关 bot/服务进程才会生效。'],
+  },
+  'settings.notification.WECOM_AIBOT_REPLY_STREAM': {
+    title: '企微智能机器人流式回复',
+    summary: '机器人回复是否使用 stream 流式消息（打字机式），默认关闭，使用一次性 markdown 回复。',
+    usage: 'WECOM_AIBOT_REPLY_STREAM=true 开启流式回复；开启前需确认企微侧已支持 stream 回复体验。',
+    valueNotes: [
+      'false（默认）：每条回复以一条完整 markdown 消息送达。',
+      'true：回复以 stream 消息帧送达（单帧 finish=true，不做渐进式打字机）。',
+    ],
+    impact: ['仅影响企微智能机器人的回复呈现形式，不影响命令处理逻辑。'],
+    notes: ['官方限制：stream 消息需在 10 分钟内 finish。'],
   },
   'settings.notification.DINGTALK_WEBHOOK_URL': {
     title: '钉钉群机器人 Webhook',
@@ -673,10 +787,11 @@ const settingsHelpZhCN: SettingsHelpMap = {
   'settings.system.schedule': {
     title: '定时任务',
     summary: '控制是否启用每日定时分析以及启动时是否立即执行一次。',
-    usage: 'SCHEDULE_TIME 使用 HH:MM 24 小时格式；SCHEDULE_TIMES 可配置逗号分隔的多个 HH:MM 时间点；SCHEDULE_ENABLED 控制 runtime scheduler 是否启用。',
+    usage: 'SCHEDULE_TIME 使用 HH:MM 24 小时格式；SCHEDULE_TIMES 可配置逗号分隔的多个 HH:MM 时间点；SCHEDULE_ENABLED 控制 runtime scheduler 是否启用；DSA_RUNTIME_SCHEDULER_TIMEOUT_SECONDS 控制单次 Web/API 定时分析的硬超时，默认 2700 秒、最小 60 秒。',
     valueNotes: [
       '已运行的 schedule 模式会在下一轮调度检查中读取新的 SCHEDULE_TIME / SCHEDULE_TIMES 并重建 daily jobs。',
       'WebUI/API/Desktop 长运行进程保存 SCHEDULE_ENABLED、SCHEDULE_TIME 或 SCHEDULE_TIMES 后会按新配置启停或重建 runtime scheduler。',
+      '修改 DSA_RUNTIME_SCHEDULER_TIMEOUT_SECONDS 后，下一次分析会使用新值，无需重建 daily jobs；超时会终止独立分析进程。',
       '定时任务触发时会读取当前保存的 STOCK_LIST。',
     ],
     impact: ['影响 schedule 模式下自动分析频率、启动行为和通知推送时间。'],
@@ -825,21 +940,11 @@ const settingsHelpZhCN: SettingsHelpMap = {
   'settings.agent.AGENT_BACKEND': {
     title: '问股生成方式',
     showFieldKey: false,
-    summary: '选择问股 Chat 使用默认模型配置，还是调用运行 DSA 设备上的 Codex。',
-    usage: '通常保持“自动（推荐）”。自动模式不会启用实验性的 Codex；只有确认运行 DSA 的设备已安装并登录 Codex 后，才选择 Codex 本地 Agent。',
-    valueNotes: [
-      '“自动（推荐）”与“默认模型配置”都继续使用现有模型和 API 配置。',
-      '“Codex 本地 Agent（实验）”目前只支持单 Agent 问股，不支持 Codex Multi Agent 或 Codex Deep Research。',
-      'Codex 本地 Agent 当前支持 macOS、Linux，以及完整运行于 WSL 的 DSA 后端；暂不支持原生 Windows 后端。',
-      '本地 Agent 不等于离线模型；股票问题和工具结果可能由 Codex 自身配置的服务处理。',
-    ],
-    impact: ['只影响问股 Chat，不改变普通报告、定时分析、现有 Multi Agent 或 Deep Research。'],
-    notes: [
-      'DSA 不读取或保存 Codex 登录凭据，Codex 进程使用自己的登录状态。',
-      '设置页状态只检查配置、Codex 命令和所需协议，不会登录、调用模型或读取股票数据；显示“可以尝试”不代表已验证可用。',
-      '保存后可直接在问股页提问；第一次问题就是第一次真实执行，若 Codex 登录或服务不可用，页面会保留问题并显示原因。',
-      '想恢复原有行为，选择“自动（推荐）”并保存。',
-    ],
+    summary: '选择问股 Chat 的默认模型执行方式。',
+    usage: '通常保持“自动（推荐）”；自动与默认模型配置都使用现有 LiteLLM 路由。',
+    valueNotes: ['Codex App Server 已移除。旧值仍显示，须主动选择合法值并保存；不会自动切换模型或账号。'],
+    impact: ['只影响问股 Chat；独立 Codex CLI 普通报告、定时分析、Multi Agent 和 Deep Research 保持原路径。'],
+    notes: ['状态与草稿预览只检查配置，不启动外部命令或调用模型。显式保存或导入退役值会被拒绝，无关设置保存不受旧值影响。'],
     examples: [],
   },
   'settings.agent.AGENT_GENERATION_BACKEND': {
@@ -861,13 +966,13 @@ const settingsHelpZhCN: SettingsHelpMap = {
   },
   'settings.agent.AGENT_MAX_STEPS': {
     title: 'Agent 最大推理步数',
-    summary: '控制默认模型 Agent 的推理步数上限，以及 Codex 单次问股可调用工具的次数上限。',
-    usage: '使用默认模型时，默认值让每个子 Agent 使用各自预设步数；调高后统一提升，调低后裁剪预设步数。使用 Codex 时，这个值限制一次问股最多可以调用多少次数据工具。',
+    summary: '控制默认模型 Agent 的推理步数上限。',
+    usage: '使用默认模型时，默认值让每个子 Agent 使用各自预设步数；调高后统一提升，调低后裁剪预设步数。',
     valueNotes: [
       '步数越高，推理越深入，但耗时和 token 消耗也越大。',
       '部分复杂场景（如多策略编排）可能需要更高步数。',
     ],
-    impact: ['影响默认模型 Agent 的推理深度，或 Codex 单次问股的数据工具调用次数，以及相应耗时和 token 消耗。'],
+    impact: ['影响默认模型 Agent 的推理深度、耗时和 token 消耗。'],
     notes: ['设为 0 或极低值可能导致推理不完整。'],
   },
   'settings.agent.AGENT_SKILLS': {
@@ -944,10 +1049,18 @@ const settingsHelpZhCN: SettingsHelpMap = {
   'settings.agent.AGENT_RISK_OVERRIDE': {
     title: '风险 Agent 否决权',
     summary: '允许风险 Agent 在检测到关键风险信号时否决买入信号。',
-    usage: '开启后，full/specialist 模式中的风险 Agent 可将买入建议降级为观望或卖出。',
-    valueNotes: ['仅在 AGENT_ORCHESTRATOR_MODE 包含风险阶段时生效。'],
+    usage: '开启后，重要风险信号可将买入建议降级为观望或卖出。',
+    valueNotes: ['full 和 specialist 包含风险阶段。quick 和 standard 在触发证据辩论时也会运行风险阶段。'],
     impact: ['影响最终投资建议的风险保守程度。'],
-    notes: ['关闭后风险 Agent 的意见仅作参考，不会否决决策。'],
+    notes: ['关闭后，已完成的风险审查仅作参考。证据辩论要求的审查未完成时仍暂缓买入。'],
+  },
+  'settings.agent.AGENT_DEBATE_ENABLED': {
+    title: '条件触发多空证据辩论',
+    summary: '在多策略分歧或高确信买入时触发结构化 Bull/Bear 证据对照与风控必审。',
+    usage: '默认关闭（false）。仅在 AGENT_ARCH=multi 时生效，前序意见出现方向分歧或买入置信度达到 0.75 时触发。',
+    valueNotes: ['quick 和 standard 在触发后运行风险阶段，full 使用已有风险阶段，specialist 在策略评估后运行风险阶段。'],
+    impact: ['影响多策略决策综合阶段的证据对照与风控审视强度。'],
+    notes: ['风险审查失败或因运行预算跳过时，系统暂缓买入。'],
   },
   'settings.agent.DEEP_RESEARCH': {
     title: 'Deep Research',
@@ -996,7 +1109,6 @@ const settingsHelpZhCN: SettingsHelpMap = {
     notes: [
       '该功能不处理 provider trace、thinking blocks、tool calls 或 tool results，也不改变同轮工具调用透传。',
       '该配置只影响问股可见历史压缩，不改变 LLM provider、模型、Base URL、保存清理或运行时优先级语义。',
-      '当前该 LLM 压缩只适用于“默认模型”问股；Codex Agent 始终使用最近 20 条用户可见对话，不会调用 Agent 主模型生成摘要。保存的压缩设置不会被清空，切回默认模型后继续生效。',
     ],
   },
   'settings.agent.event_monitor': {
@@ -1237,7 +1349,7 @@ const settingsHelpZhCN: SettingsHelpMap = {
     summary: '控制大盘分析功能的开关、支持的市场子集和配色方案。',
     usage: 'MARKET_REVIEW_ENABLED 开启大盘分析；DAILY_MARKET_CONTEXT_ENABLED 默认开启，会把当日大盘摘要用于个股分析 Prompt 与保守护栏；MARKET_REVIEW_REGION 支持输入逗号分隔的市场子集（如 cn,us,jp 或 cn,us,jp,kr），不传可回退为 cn；MARKET_REVIEW_COLOR_SCHEME 选择配色。',
     valueNotes: [
-      'cn 覆盖 A 股，hk 覆盖港股，us 覆盖美股，jp 覆盖日股，kr 覆盖韩股，both 覆盖全部（cn,hk,us,jp,kr）。',
+      'cn 覆盖 A 股，hk 覆盖港股，us 覆盖美股，jp 覆盖日股，kr 覆盖韩股，tw 覆盖台股，both 覆盖全部六市场（cn,hk,us,jp,kr,tw），会增加请求次数和耗时；保留旧范围请填 cn,hk,us,jp,kr。',
       'MARKET_REVIEW_REGION 直接写入文本框，支持逗号分隔的子集；空值或非法值会回退到 cn。',
       '默认开启 DAILY_MARKET_CONTEXT_ENABLED；设为 false 后仍可生成大盘复盘报告，但个股分析不会读取大盘摘要或软化买入/加仓建议。',
       '配色方案影响大盘报告中指数涨跌的颜色显示：green_up 为绿涨红跌，red_up 为红涨绿跌。',
@@ -1331,7 +1443,7 @@ const settingsHelpEnUS: SettingsHelpMap = {
   'settings.ai_model.LITELLM_MODEL': {
     title: 'Primary Model',
     summary: 'Selects the default LLM model for regular analysis flows.',
-    usage: 'Use provider/model format, such as deepseek/deepseek-v4-flash, gemini/gemini-3.1-pro-preview, or ollama/qwen3:8b.',
+    usage: 'Use provider/model format, such as deepseek/deepseek-v4-flash, gemini/gemini-3.6-flash, or ollama/qwen3:8b.',
     valueNotes: [
       'Runtime priority is LITELLM_CONFIG > LLM_CHANNELS > legacy provider keys.',
       'When empty, the system tries to infer a model from available API keys or channels.',
@@ -1361,9 +1473,9 @@ const settingsHelpEnUS: SettingsHelpMap = {
   'settings.ai_model.AGENT_LITELLM_MODEL': {
     title: 'Agent Primary Model',
     summary: 'Sets a dedicated model for Agent workflows.',
-    usage: 'Use provider/model format. When empty, Agent inherits the regular primary model. The value is preserved but not used by Codex local Agent Chat.',
+    usage: 'Use provider/model format. When empty, Agent inherits the regular primary model.',
     valueNotes: ['Useful when Agent needs stronger reasoning or longer context.', 'Only affects Agent flows.'],
-    impact: ['Affects default-model Agent chat, strategy selection, and Agent tool calls; it does not affect Codex local Agent.'],
+    impact: ['Affects default-model Agent chat, strategy selection, and Agent tool calls.'],
     notes: ['Make sure the model is reachable through enabled channels, YAML routing, or legacy provider keys.'],
   },
   'settings.ai_model.LITELLM_FALLBACK_MODELS': {
@@ -1482,6 +1594,30 @@ const settingsHelpEnUS: SettingsHelpMap = {
     impact: ['Affects some A-share base data, stock lists, and enrichment data.'],
     notes: ['Do not commit the token or print it in public logs.'],
   },
+  'settings.data_source.CROSS_ASSET_CONTEXT_ENABLED': {
+    title: 'Cross-Asset Context',
+    summary: 'Inject a low-sensitivity cross-asset summary (indices / VIX / US 10Y) into stock analysis for risk appetite calibration.',
+    usage: 'Disabled by default (opt-in) with zero behavior change when unset. When enabled, provider failures fail open to an unknown minimal context without interrupting analysis.',
+    valueNotes: ['Provides low-sensitivity risk appetite calibration only; never creates direct buy/sell rules.'],
+    impact: ['Adds a small number of external market-data requests per stock analysis when enabled.'],
+    notes: ['When disabled, stock analysis omits cross-asset context.'],
+  },
+  'settings.data_source.TICKPLUS_API_KEY': {
+    title: 'TickPlus API Key (Recommended)',
+    summary: 'Preferred A-share/ETF daily bars, realtime indicators and names; ETF rotation uses forward adjustment.',
+    usage: 'Use your own console key. TickPlus is preferred unless realtime priority is explicitly configured.',
+    valueNotes: ['Optional: other providers remain available without a key.', 'Quota, rate limits and expiry depend on the platform.'],
+    impact: ['Affects ordinary A-share/ETF daily bars, realtime indicators and ETF rotation. Index and overseas routes are unchanged.'],
+    notes: ['Failures fall back. Never publish test keys. Registered indices and overseas routes are unchanged.'],
+  },
+  'settings.data_source.TICKPLUS_PRIORITY': {
+    title: 'TickPlus Daily Priority',
+    summary: 'Lower numbers run first; default 0, before built-in sources at the same priority.',
+    usage: 'For ordinary A-share/ETF daily bars. Realtime order uses REALTIME_SOURCE_PRIORITY.',
+    valueNotes: ['Use a non-negative integer. TickPlus requires a configured API key.'],
+    impact: ['Changes the order in which daily data providers are tried.'],
+    notes: ['Explicit realtime priority overrides are preserved.'],
+  },
   'settings.data_source.TICKFLOW_API_KEY': {
     title: 'TickFlow API Key',
     summary: 'Enables optional TickFlow A-share daily K-lines, realtime quotes, stock list/name lookup, and market-review data.',
@@ -1490,12 +1626,28 @@ const settingsHelpEnUS: SettingsHelpMap = {
     impact: ['Affects A-share daily-data fallback, realtime quotes, stock list/name lookup, and market-review coverage.'],
     notes: ['Do not expose real keys in issues, logs, or screenshots.'],
   },
+  'settings.data_source.MX_APIKEY': {
+    title: 'MiaoXiang (MX_API) API Key',
+    summary: 'Enables the MiaoXiang supplementary provider: fills chip distribution and per-stock capital flow when public eastmoney endpoints fail or are rate-limited.',
+    usage: 'Paste a MiaoXiang Skills API key here. When empty, system behavior is unchanged.',
+    valueNotes: ['Optional supplementary key; does not participate in the daily K-line chain.'],
+    impact: ['Affects chip-distribution and capital-flow availability when eastmoney endpoints misbehave.'],
+    notes: ['Do not expose real keys in issues, logs, or screenshots.'],
+  },
+  'settings.data_source.MX_PRIORITY': {
+    title: 'MiaoXiang Provider Priority',
+    summary: 'Controls where the MiaoXiang supplementary provider sits in the fallback chain.',
+    usage: 'Use an integer. Lower numbers are tried earlier. The default is 6. No effect unless MX_APIKEY is configured.',
+    valueNotes: ['This provider does not serve daily K-lines; the priority only orders supplementary blocks.'],
+    impact: ['Affects fallback order of supplementary data blocks.'],
+    notes: ['The default is fine for most setups.'],
+  },
   'settings.data_source.TICKFLOW_PRIORITY': {
     title: 'TickFlow Daily K-line Priority',
-    summary: 'Controls where TickFlow sits in the A-share daily K-line provider fallback chain.',
-    usage: 'Use an integer. Lower numbers are tried earlier. The default is 2. This has no effect unless TICKFLOW_API_KEY is configured.',
-    valueNotes: ['This setting only affects the daily K-line/general data-source fallback chain; it does not control realtime quote provider order.'],
-    impact: ['Affects provider order for A-share daily K-line fetching. Realtime quotes are still controlled separately by REALTIME_SOURCE_PRIORITY.'],
+    summary: 'Controls where TickFlow sits in the generic A-share daily K-line provider fallback chain.',
+    usage: 'Use an integer. Lower numbers are tried earlier. The default is 2. This has no effect unless TICKFLOW_API_KEY is configured. Registered indices use the fixed Tencent → AkShare → TickFlow → YFinance chain and ignore this setting.',
+    valueNotes: ['This setting only affects generic A-share daily K-lines; it does not control registered-index or realtime-quote provider order.'],
+    impact: ['Affects provider order for generic A-share daily K-line fetching. Registered indices and realtime quotes use separate ordering.'],
     notes: ['Lower this value only if you want TickFlow daily K-lines to be tried earlier. Add tickflow to REALTIME_SOURCE_PRIORITY when you want TickFlow realtime quotes in the realtime fallback chain.'],
   },
   'settings.data_source.TICKFLOW_KLINE_ADJUST': {
@@ -1522,6 +1674,30 @@ const settingsHelpEnUS: SettingsHelpMap = {
     impact: ['Affects request count and per-request pressure for TickFlow batch prefetch.'],
     notes: ['This setting only affects TickFlow batch paths.'],
   },
+  'settings.data_source.FUTU_OPEND_HOST': {
+    title: 'Futu OpenD Host',
+    summary: 'Configures the Futu OpenD service address. Leave empty to disable Futu.',
+    usage: 'Use an IPv4 address or a hostname resolving to IPv4.',
+    valueNotes: ['The OpenD service must be reachable from the DSA container.'],
+    impact: ['Affects Futu HK realtime, historical, and fundamental data access.'],
+    notes: ['This is a service address, not a Futu account credential.'],
+  },
+  'settings.data_source.FUTU_OPEND_PORT': {
+    title: 'Futu OpenD Port',
+    summary: 'Configures the Futu OpenD TCP port.',
+    usage: 'Use a port from 1 to 65535; the default is 11111.',
+    valueNotes: ['The port must match the OpenD listener.'],
+    impact: ['Affects the DSA connection to Futu OpenD.'],
+    notes: ['Restarting DSA is normally required after changing it.'],
+  },
+  'settings.data_source.FUTU_HK_REALTIME_SOURCE_PRIORITY': {
+    title: 'Futu HK Realtime Source Priority',
+    summary: 'Configures the Futu/Longbridge/AkShare/Yfinance order for HK realtime quotes.',
+    usage: 'Use comma-separated futu, longbridge, akshare, or yfinance values.',
+    valueNotes: ['Earlier providers are tried first; failures fall back automatically.'],
+    impact: ['Affects HK realtime quotes only, not A-share realtime priority.'],
+    notes: ['The futu entry is skipped when OpenD is not configured.'],
+  },
   'settings.data_source.stock_index_remote': {
     title: 'Remote Stock Index',
     summary: 'Fetches the latest stock autocomplete index from GitHub main and caches it locally.',
@@ -1532,10 +1708,10 @@ const settingsHelpEnUS: SettingsHelpMap = {
   },
   'settings.base.SCREENING_ENABLED': {
     title: 'Screening',
-    summary: 'Controls the Screening page, implemented with reference to AlphaSift.',
-    usage: 'Disabled by default. Set it to true to show Screening and enable screening strategies.',
+    summary: 'Controls screening strategies, implemented with reference to AlphaSift.',
+    usage: 'Disabled by default. Screening stays in navigation; set this to true to run screening strategies.',
     valueNotes: ['Screening output is for research support only and is not investment advice.'],
-    impact: ['Affects the Web screening entry, strategy loading, and screening API.'],
+    impact: ['Affects strategy loading and the screening API, without hiding the navigation entry.'],
     notes: ['Disabling it does not affect existing analysis, reports, or notifications.'],
   },
   'settings.data_source.REALTIME_SOURCE_PRIORITY': {
@@ -1690,6 +1866,56 @@ const settingsHelpEnUS: SettingsHelpMap = {
       'Restart the relevant bot/service process after saving; existing long connections are not rebuilt automatically.',
       'Do not treat Stream mode and group bot Webhook as the same delivery path.',
     ],
+  },
+  'settings.notification.WECOM_AIBOT_ENABLED': {
+    title: 'WeCom AI Bot Stream Mode',
+    summary: 'Enables the WeCom AI (smart) robot WebSocket long-connection mode for conversational bot commands, separate from the enterprise WeChat group webhook push channel.',
+    usage: 'Create a smart robot in the enterprise WeChat console first, fill in WECOM_AIBOT_BOT_ID and WECOM_AIBOT_SECRET, then enable this switch.',
+    valueNotes: [
+      'true allows the runtime to exchange smart-robot messages over the official long connection.',
+      'false disables it (default); existing enterprise WeChat group webhook push behavior is unchanged.',
+    ],
+    impact: [
+      'Affects the WeCom AI bot conversational command path.',
+      'Does not change the enterprise WeChat group webhook delivery path.',
+    ],
+    notes: [
+      'The long-connection mode needs no public IP; a callback URL mode is not provided.',
+      'Restart the relevant bot/service process after saving to establish the connection.',
+    ],
+  },
+  'settings.notification.WECOM_AIBOT_BOT_ID': {
+    title: 'WeCom AI Bot ID',
+    summary: 'Bot ID of the WeCom AI (smart) robot from the enterprise WeChat console; required for the long-connection mode.',
+    usage: 'Copy the Bot ID from the smart robot details in the enterprise WeChat console into WECOM_AIBOT_BOT_ID.',
+    valueNotes: [
+      'Only used for long-connection authentication (aibot_subscribe frame); unrelated to the group webhook key.',
+      'Required when WECOM_AIBOT_ENABLED=true; the client will not start without it.',
+    ],
+    impact: ['Determines whether the WeCom AI bot long-connection authentication succeeds.'],
+    notes: ['For robots not created by a super admin, from.userid arrives encrypted — an official protocol limitation.'],
+  },
+  'settings.notification.WECOM_AIBOT_SECRET': {
+    title: 'WeCom AI Bot Secret',
+    summary: 'Dedicated secret for the smart-robot long-connection mode; it differs from the group webhook Token/EncodingAESKey credentials.',
+    usage: 'Copy the long-connection secret from the smart robot details into WECOM_AIBOT_SECRET.',
+    valueNotes: [
+      'Long-connection credential only; do not mix it up with callback-mode Token/EncodingAESKey.',
+      'Treat it as a secret and reset it in the console if leaked.',
+    ],
+    impact: ['Determines whether the WeCom AI bot long-connection authentication succeeds.'],
+    notes: ['Restart the relevant bot/service process after saving.'],
+  },
+  'settings.notification.WECOM_AIBOT_REPLY_STREAM': {
+    title: 'WeCom AI Bot Stream Reply',
+    summary: 'Whether bot replies use streaming (stream msgtype) messages; off by default, replies are sent as one-shot markdown.',
+    usage: 'Set WECOM_AIBOT_REPLY_STREAM=true to enable stream replies after confirming the WeCom side supports the stream reply experience.',
+    valueNotes: [
+      'false (default): each reply is delivered as one complete markdown message.',
+      'true: replies are delivered as stream message frames (single frame with finish=true, no progressive typing effect).',
+    ],
+    impact: ['Only affects how WeCom AI bot replies are presented; command handling is unchanged.'],
+    notes: ['Official constraint: a stream message must finish within 10 minutes.'],
   },
   'settings.notification.DINGTALK_WEBHOOK_URL': {
     title: 'DingTalk Group Bot Webhook',
@@ -1860,10 +2086,11 @@ const settingsHelpEnUS: SettingsHelpMap = {
   'settings.system.schedule': {
     title: 'Schedule',
     summary: 'Controls daily scheduled analysis and whether startup runs immediately.',
-    usage: 'SCHEDULE_TIME uses HH:MM 24-hour format. SCHEDULE_TIMES accepts comma-separated HH:MM values. SCHEDULE_ENABLED controls whether the runtime scheduler is enabled.',
+    usage: 'SCHEDULE_TIME uses HH:MM 24-hour format. SCHEDULE_TIMES accepts comma-separated HH:MM values. SCHEDULE_ENABLED controls whether the runtime scheduler is enabled. DSA_RUNTIME_SCHEDULER_TIMEOUT_SECONDS sets the hard timeout for each Web/API scheduled analysis (default 2700 seconds, minimum 60).',
     valueNotes: [
       'An already-running schedule mode reads new SCHEDULE_TIME / SCHEDULE_TIMES values on the next scheduler check and rebuilds the daily jobs.',
       'Long-running WebUI/API/Desktop processes start, stop, or rebuild the runtime scheduler after saving SCHEDULE_ENABLED, SCHEDULE_TIME, or SCHEDULE_TIMES.',
+      'After DSA_RUNTIME_SCHEDULER_TIMEOUT_SECONDS changes, the next analysis uses the new value without rebuilding daily jobs; the isolated analysis process is terminated on timeout.',
       'Scheduled runs read the currently saved STOCK_LIST.',
     ],
     impact: ['Affects automatic analysis frequency, startup behavior, and notification timing in schedule mode.'],
@@ -2010,23 +2237,13 @@ const settingsHelpEnUS: SettingsHelpMap = {
     notes: ['Agent mode consumes more tokens and time; best for scenarios requiring deep reasoning.'],
   },
   'settings.agent.AGENT_BACKEND': {
-    title: 'Ask-Stock Method',
+    title: 'Ask-stock method',
     showFieldKey: false,
-    summary: 'Choose whether ask-stock Chat uses the default model configuration or Codex on the device running DSA.',
-    usage: 'Keep Auto (recommended) unless Codex is installed and signed in on the device running DSA. Auto never enables the experimental Codex route.',
-    valueNotes: [
-      'Auto (recommended) and Default model settings both keep the existing model and API route.',
-      'Codex local Agent (experimental) currently supports single-agent Chat only, not Codex Multi Agent or Codex Deep Research.',
-      'Codex local Agent currently supports macOS, Linux, and a DSA backend running completely inside WSL; native Windows backends are not supported yet.',
-      'A local Agent is not an offline model; stock questions and tool results may be processed by services configured in Codex.',
-    ],
-    impact: ['Only affects ask-stock Chat. Regular reports, scheduled analysis, existing Multi Agent, and Deep Research stay unchanged.'],
-    notes: [
-      'DSA does not read or store Codex credentials. The Codex process uses its own sign-in state.',
-      'Settings checks only configuration, the Codex command, and the required protocol. It does not sign in, call a model, or read stock data; “Can try” is not a verified-success claim.',
-      'After saving, ask directly in Chat. The first question is the first real execution; if sign-in or the Codex service fails, Chat preserves the question and explains what happened.',
-      'To restore the original behavior, select Auto (recommended) and save.',
-    ],
+    summary: 'Choose the default-model execution method for ask-stock Chat.',
+    usage: 'Keep Auto (recommended). Both Auto and Default model settings use the existing LiteLLM route.',
+    valueNotes: ['Codex App Server has been removed. Existing values stay visible until you choose a supported value and save; models and accounts are never switched automatically.'],
+    impact: ['Only affects ask-stock Chat. Standalone Codex CLI reports, scheduled analysis, Multi Agent, and Deep Research keep their existing paths.'],
+    notes: ['Status and draft previews inspect configuration without external commands or models. Explicitly saving or importing the retired value is rejected; unrelated settings can still be saved.'],
     examples: [],
   },
   'settings.agent.AGENT_GENERATION_BACKEND': {
@@ -2048,13 +2265,13 @@ const settingsHelpEnUS: SettingsHelpMap = {
   },
   'settings.agent.AGENT_MAX_STEPS': {
     title: 'Agent Max Steps',
-    summary: 'Caps default-model Agent reasoning steps and Codex tool calls per ask-stock turn.',
-    usage: 'With the default-model Agent, the default lets each sub-agent keep its preset; raising the value lifts all sub-agents, while lowering it caps larger presets. With Codex, the value limits how many data-tool calls one ask-stock turn may make.',
+    summary: 'Caps default-model Agent reasoning steps.',
+    usage: 'With the default-model Agent, the default lets each sub-agent keep its preset; raising the value lifts all sub-agents, while lowering it caps larger presets.',
     valueNotes: [
       'Higher steps enable deeper reasoning but increase time and token cost.',
       'Complex scenarios (e.g. multi-strategy orchestration) may need higher values.',
     ],
-    impact: ['Affects default-model reasoning depth or Codex data-tool calls per turn, together with duration and token consumption.'],
+    impact: ['Affects default-model reasoning depth, duration and token consumption.'],
     notes: ['Very low values may cause incomplete reasoning.'],
   },
   'settings.agent.AGENT_SKILLS': {
@@ -2131,10 +2348,18 @@ const settingsHelpEnUS: SettingsHelpMap = {
   'settings.agent.AGENT_RISK_OVERRIDE': {
     title: 'Risk Agent Veto',
     summary: 'Allows the risk agent to veto buy signals when critical risk flags are detected.',
-    usage: 'When enabled, the risk agent in full/specialist mode can downgrade buy recommendations to hold or sell.',
-    valueNotes: ['Only effective when AGENT_ORCHESTRATOR_MODE includes the risk stage.'],
+    usage: 'When enabled, material risk signals can downgrade buy recommendations to hold or sell.',
+    valueNotes: ['Full and specialist include a risk stage. Quick and standard also run it when the evidence debate triggers.'],
     impact: ['Affects the risk conservatism of final investment recommendations.'],
-    notes: ['When disabled, the risk agent opinion is advisory only and cannot override decisions.'],
+    notes: ['When disabled, completed reviews are advisory. An incomplete review required by the evidence debate still defers buying.'],
+  },
+  'settings.agent.AGENT_DEBATE_ENABLED': {
+    title: 'Conditional Bull/Bear Evidence Debate',
+    summary: 'Triggers an evidence-bound Bull/Bear contrast brief and mandatory risk review on strategy disagreement or high-conviction buy signals.',
+    usage: 'Defaults to false. With AGENT_ARCH=multi, triggers on directional disagreement or a buy opinion with at least 0.75 confidence.',
+    valueNotes: ['Quick and standard run a risk stage when triggered. Full uses its existing risk stage. Specialist runs it after strategy evaluation.'],
+    impact: ['Enhances evidence traceability and risk review before final decision synthesis.'],
+    notes: ['If the review fails or runs out of time, the system defers buying.'],
   },
   'settings.agent.DEEP_RESEARCH': {
     title: 'Deep Research',
@@ -2183,7 +2408,6 @@ const settingsHelpEnUS: SettingsHelpMap = {
     notes: [
       'This feature does not process provider traces, thinking blocks, tool calls, or tool results, and does not change same-turn tool passthrough.',
       'It only affects visible ask-stock history compression; it does not change LLM provider, model, Base URL, save cleanup, or runtime priority semantics.',
-      'This LLM compression currently applies only to Default model ask-stock. Codex Agent always uses the 20 most recent user-visible messages and does not call the Agent primary model for summaries. The saved setting is retained and takes effect again after switching back to Default model.',
     ],
   },
   'settings.agent.event_monitor': {
@@ -2424,7 +2648,7 @@ const settingsHelpEnUS: SettingsHelpMap = {
     summary: 'Controls the market review feature: on/off, market subset input, and color scheme.',
     usage: 'MARKET_REVIEW_ENABLED toggles market review; DAILY_MARKET_CONTEXT_ENABLED is on by default and controls whether the daily market summary is injected into stock-analysis prompts and conservative guardrails; MARKET_REVIEW_REGION accepts a comma-separated region subset (for example cn,us,jp or cn,us,jp,kr), and `both` keeps all supported markets; invalid or empty values fall back to `cn`; MARKET_REVIEW_COLOR_SCHEME selects colors.',
     valueNotes: [
-      'cn covers A-shares, hk covers Hong Kong, us covers US stocks, jp covers Japan, kr covers Korea, and both covers all (cn,hk,us,jp,kr).',
+      'cn covers A-shares, hk covers Hong Kong, us covers US stocks, jp covers Japan, kr covers Korea, tw covers Taiwan, and both covers all six (cn,hk,us,jp,kr,tw), adding requests and latency. Use cn,hk,us,jp,kr to retain the previous scope.',
       'MARKET_REVIEW_REGION is free-text input; you can enter a comma-separated subset like cn,us or cn,us,jp,kr.',
       'DAILY_MARKET_CONTEXT_ENABLED is enabled by default; set it to false to keep market review reports running without injecting the summary into stock analysis or softening buy/add advice.',
       'Color scheme affects how index changes are displayed: green_up = green for gains/red for losses; red_up = red for gains/green for losses.',

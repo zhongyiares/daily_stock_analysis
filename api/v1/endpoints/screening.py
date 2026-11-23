@@ -4,15 +4,19 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-from api.deps import get_config_dep, get_database_manager
+from api.deps import get_config_dep, get_database_manager, get_system_config_service
 from api.v1.errors import api_error
 from src.config import Config
-from src.services.screening_service import ScreeningService
+from src.services.screening.config import Config as ScreeningRuntimeConfig
+from src.services.screening.filter import check_hard_filters, validate_check_snapshot
+from src.services.screening.strategy import load_all_strategies
+from src.services.screening_service import ScreeningService, _ensure_screening_enabled
+from src.services.system_config_service import ConfigConflictError, SystemConfigService
 from src.services.task_queue import TaskStatus as QueueTaskStatus
 from src.services.task_queue import get_task_queue
 from src.storage import DatabaseManager
@@ -25,6 +29,40 @@ class ScreeningScreenRequest(BaseModel):
     strategy: str = Field("dual_low", min_length=1, max_length=64)
     max_results: int = Field(20, ge=1, le=100)
     variant_seed: str = Field("", max_length=128)
+
+
+class ScreeningCheckRequest(BaseModel):
+    market: Literal["cn", "us"] = "cn"
+    strategy: str = Field("dual_low", min_length=1, max_length=64)
+    snapshot: Dict[str, Any] = Field(description="One supplied row; no live data is fetched")
+
+    @field_validator("snapshot", mode="before")
+    @classmethod
+    def validate_snapshot(cls, value: Any) -> Dict[str, Any]:
+        try:
+            return validate_check_snapshot(value)
+        except ValueError as exc:
+            raise api_error(422, "screening_invalid_snapshot", str(exc)) from exc
+
+
+class ScreeningConditionCheck(BaseModel):
+    filter: str
+    field: str
+    source_field: Optional[str]
+    threshold: Any
+    current_value: Any
+    status: Literal["pass", "fail", "missing"]
+    passed: Optional[bool]
+    missing_reason: Optional[str]
+
+
+class ScreeningCheckResponse(BaseModel):
+    strategy: str
+    strategy_version: str
+    market: Literal["cn", "us"]
+    provenance: Literal["supplied_snapshot"] = "supplied_snapshot"
+    passed: bool
+    checks: List[ScreeningConditionCheck]
 
 
 class ScreeningStrategyResponse(BaseModel):
@@ -127,6 +165,30 @@ def screening_hotspot_detail(
         provider=provider,
         refresh=refresh_value,
         include_search=include_search_value,
+    )
+
+
+@router.post("/screen/check", response_model=ScreeningCheckResponse)
+def screening_check(
+    request: ScreeningCheckRequest,
+    config: Config = Depends(get_config_dep),
+) -> ScreeningCheckResponse:
+    """Check supplied values against all strategy hard filters, without fetching."""
+    _ensure_screening_enabled(config)
+    strategies = load_all_strategies(ScreeningRuntimeConfig.from_env().strategies_dir)
+    # Lookup catalog IDs only; never interpolate caller input into a file path.
+    strategy = strategies.get(request.strategy)
+    if strategy is None:
+        raise api_error(422, "screening_invalid_strategy", "Unknown or disabled screening strategy.")
+    if request.market not in strategy.screening.market_scope:
+        raise api_error(422, "screening_invalid_market", "Strategy does not support this market.")
+    checks = check_hard_filters(request.snapshot, strategy.screening.hard_filters)
+    return ScreeningCheckResponse(
+        strategy=strategy.name,
+        strategy_version=strategy.version,
+        market=request.market,
+        passed=all(item["passed"] is True for item in checks),
+        checks=checks,
     )
 
 
@@ -248,3 +310,70 @@ def screening_source_history(
     db_manager: DatabaseManager = Depends(get_database_manager),
 ) -> Dict[str, Any]:
     return _service(config, db_manager).source_history(limit=limit)
+
+
+class ScreeningPromoteRequest(BaseModel):
+    top_n: int = Field(10, ge=1, le=30)
+
+
+class ScreeningAnalyzeTopRequest(BaseModel):
+    top_n: int = Field(5, ge=1, le=10)
+    report_type: Literal["simple", "detailed", "full", "brief"] = "detailed"
+
+
+@router.post("/runs/{run_id}/promote-watchlist")
+def promote_screening_run_to_watchlist(
+    run_id: str,
+    request: Optional[ScreeningPromoteRequest] = None,
+    config: Config = Depends(get_config_dep),
+    db_manager: DatabaseManager = Depends(get_database_manager),
+    config_service: SystemConfigService = Depends(get_system_config_service),
+) -> Dict[str, Any]:
+    from src.services.screening_funnel_service import promote_screening_to_watchlist
+
+    _ensure_screening_enabled(config)
+    req = request or ScreeningPromoteRequest()
+    try:
+        return promote_screening_to_watchlist(
+            run_id, top_n=req.top_n, db_manager=db_manager, config_service=config_service,
+        )
+    except HTTPException:
+        raise
+    except LookupError as exc:
+        raise api_error(404, "screening_run_not_found", str(exc)) from exc
+    except ConfigConflictError as exc:
+        raise api_error(409, "config_conflict", str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "screening_promote_failed", "message": str(exc)},
+        ) from exc
+
+
+@router.post("/runs/{run_id}/analyze-top")
+def analyze_screening_run_top(
+    run_id: str,
+    request: Optional[ScreeningAnalyzeTopRequest] = None,
+    config: Config = Depends(get_config_dep),
+    db_manager: DatabaseManager = Depends(get_database_manager),
+) -> Dict[str, Any]:
+    from src.services.screening_funnel_service import analyze_screening_candidates
+
+    _ensure_screening_enabled(config)
+    req = request or ScreeningAnalyzeTopRequest()
+    try:
+        return analyze_screening_candidates(
+            run_id,
+            top_n=req.top_n,
+            report_type=req.report_type,
+            db_manager=db_manager,
+        )
+    except HTTPException:
+        raise
+    except LookupError as exc:
+        raise api_error(404, "screening_run_not_found", str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "screening_analyze_failed", "message": str(exc)},
+        ) from exc

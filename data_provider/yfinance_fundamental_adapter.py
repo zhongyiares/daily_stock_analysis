@@ -33,6 +33,8 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+from .us_index_mapping import get_us_stock_yf_symbol
+
 logger = logging.getLogger(__name__)
 
 
@@ -92,17 +94,29 @@ def _latest_value(row: Optional[pd.Series]) -> Optional[float]:
 
 
 def _yoy_from_row(row: Optional[pd.Series]) -> Optional[float]:
-    """Statement-derived YoY: requires the same quarter from 4 quarters back.
+    """Statement-derived YoY: requires the same quarter one year earlier.
 
+    The prior-year quarter is matched by date (within 45 days), not by
+    position, so a quarter missing from the statement cannot shift the base.
     yfinance ``quarterly_*_stmt`` returns 4 quarters by default, so this
     typically returns None and callers fall back to ``info.revenueGrowth`` /
     ``info.earningsGrowth`` (already TTM YoY ratios). Doing QoQ via ``iloc[1]``
     is wrong for seasonal businesses — explicitly refuse it.
     """
-    if row is None or row.empty or len(row) < 5:
+    if row is None or row.empty:
         return None
-    latest = _safe_float(row.iloc[0])
-    prev_year = _safe_float(row.iloc[4])
+    try:
+        dates = pd.to_datetime(row.index)
+    except (TypeError, ValueError):
+        return None
+    series = pd.Series(row.values, index=dates).sort_index(ascending=False)
+    latest_date = series.index[0]
+    latest = _safe_float(series.iloc[0])
+    target = latest_date - pd.DateOffset(years=1)
+    candidates = [(abs((d - target).days), d) for d in series.index[1:] if abs((d - target).days) <= 45]
+    if not candidates:
+        return None
+    prev_year = _safe_float(series[min(candidates)[1]])
     if latest is None or prev_year in (None, 0):
         return None
     return round((latest - prev_year) / abs(prev_year) * 100.0, 4)
@@ -126,6 +140,9 @@ def _convert_to_yf_symbol(stock_code: str) -> str:
     code = (stock_code or "").strip().upper()
     if not code:
         return code
+    yf_symbol = get_us_stock_yf_symbol(code)
+    if yf_symbol:
+        return yf_symbol
     if code.startswith("HK"):
         digits = code[2:].lstrip("0") or "0"
         return f"{digits.zfill(4)}.HK"
@@ -241,7 +258,7 @@ class YfinanceFundamentalAdapter:
             if margin is not None:
                 net_profit_latest = revenue_latest * margin
 
-        # Statement-derived YoY (requires 4 quarters of history) is preferred
+        # Statement-derived YoY (requires the same quarter a year earlier) is preferred
         # over .info ratios; otherwise keep the TTM growth values already set
         # from info.revenueGrowth / info.earningsGrowth above. Refuse QoQ
         # fallback — it produces misleading numbers for seasonal businesses.

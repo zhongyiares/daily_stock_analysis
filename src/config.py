@@ -14,9 +14,10 @@ import json
 import logging
 import os
 import re
+import sys
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple
 from urllib.parse import unquote, urlparse
 from dotenv import load_dotenv, dotenv_values
 from dataclasses import dataclass, field
@@ -121,12 +122,31 @@ _FALLBACK_LITELLM_MODEL_PROVIDERS = _MANAGED_LITELLM_KEY_PROVIDERS | set(SUPPORT
 }
 _FALSEY_ENV_VALUES = {"0", "false", "no", "off"}
 PROMPT_CACHE_DIAGNOSTICS_LEVELS = {"off", "basic", "debug"}
-SUPPORTED_AGENT_BACKENDS = {"auto", "litellm", "codex_app_server"}
+SUPPORTED_AGENT_BACKENDS = {"auto", "litellm"}
+AGENT_BACKEND_REMOVED_MESSAGE = (
+    "Codex App Server 问股后端已移除。请在 Agent 设置中主动改为默认执行方式，并配置所需模型来源。"
+    "独立 Codex CLI 普通报告不受本项移除影响。"
+)
 TICKFLOW_KLINE_ADJUST_VALUES = {"none", "forward", "backward", "forward_additive", "backward_additive"}
+# 沪深300 / 中证500 / 创业板 / 红利低波 / 纳指 / 黄金；防守资产为货币 ETF
+DEFAULT_ETF_ROTATION_POOL = ("510300", "510500", "159915", "512890", "513100", "518880")
+DEFAULT_ETF_ROTATION_SAFE_ASSET = "511880"
 # Fallback defaults used when ANSPIRE_API_KEYS is reused as legacy OpenAI-compatible source.
 # These are compatibility examples; actual availability should be validated by Anspire console/model entitlement.
 ANSPIRE_LLM_BASE_URL_DEFAULT = "https://open-gateway.anspire.cn/v6"
 ANSPIRE_LLM_MODEL_DEFAULT = "Doubao-Seed-2.0-lite"
+MODELFLARE_LLM_BASE_URL_DEFAULT = "https://modelflare.dev/v1"
+MODELFLARE_LLM_MODEL_DEFAULT = "openai/gpt-6.1-sol"
+
+
+def _safe_urlparse(value: Optional[str]):
+    """Parse a URL without raising ValueError on malformed bracketed hosts or invalid ports."""
+    try:
+        parsed = urlparse((value or "").strip())
+        _ = parsed.port
+        return parsed
+    except ValueError:
+        return None
 
 
 def _has_ntfy_topic_endpoint(value: Optional[str]) -> bool:
@@ -134,8 +154,8 @@ def _has_ntfy_topic_endpoint(value: Optional[str]) -> bool:
     raw_url = (value or "").strip()
     if not raw_url:
         return False
-    parsed = urlparse(raw_url)
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+    parsed = _safe_urlparse(raw_url)
+    if parsed is None or parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         return False
     return any(unquote(segment).strip() for segment in parsed.path.split("/") if segment)
 
@@ -145,8 +165,8 @@ def _has_gotify_base_url(value: Optional[str]) -> bool:
     raw_url = (value or "").strip().rstrip("/")
     if not raw_url:
         return False
-    parsed = urlparse(raw_url)
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+    parsed = _safe_urlparse(raw_url)
+    if parsed is None or parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         return False
     if parsed.query or parsed.fragment:
         return False
@@ -442,6 +462,12 @@ def get_litellm_model_providers() -> frozenset[str]:
     installation gets the complete provider set from its pinned LiteLLM.
     """
     providers = set(_FALLBACK_LITELLM_MODEL_PROVIDERS)
+    had_litellm = "litellm" in sys.modules
+    prev_cost_map_env = os.environ.get("LITELLM_LOCAL_MODEL_COST_MAP")
+    if not had_litellm and prev_cost_map_env is None:
+        # Prevent litellm.__init__ from fetching GitHub's model_prices JSON
+        # during offline config/doctor initialization.
+        os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
     try:
         from litellm.types.utils import LlmProviders
 
@@ -452,6 +478,9 @@ def get_litellm_model_providers() -> frozenset[str]:
         )
     except (ImportError, AttributeError, TypeError):
         logger.debug("LiteLLM provider metadata unavailable; using the compatibility fallback")
+    finally:
+        if not had_litellm and prev_cost_map_env is None:
+            os.environ.pop("LITELLM_LOCAL_MODEL_COST_MAP", None)
     return frozenset(providers)
 
 
@@ -498,6 +527,61 @@ def apply_litellm_api_surface(model: str, api_surface: Optional[str]) -> str:
     return f"{provider}/responses/{remainder}"
 
 
+def resolve_llm_channel_base_url(channel_name: str, base_url: Optional[str]) -> str:
+    """Apply named-channel endpoint defaults without changing explicit configuration."""
+    explicit = (base_url or "").strip()
+    if explicit:
+        return explicit
+    if channel_name.strip().lower() == "modelflare":
+        return MODELFLARE_LLM_BASE_URL_DEFAULT
+    return ""
+
+
+def resolve_llm_channel_names(config_map: Mapping[str, str]) -> str:
+    """Infer the Modelflare channel from its key unless channels are explicit."""
+    channels = (config_map.get("LLM_CHANNELS") or "").strip()
+    if channels:
+        return channels
+    if any(
+        key.strip()
+        for field in ("MODELFLARE_KEY", "LLM_MODELFLARE_API_KEY", "LLM_MODELFLARE_API_KEYS")
+        for key in (config_map.get(field) or "").split(',')
+    ):
+        return "modelflare"
+    return ""
+
+
+def resolve_llm_channel_api_keys(
+    channel_name: str, api_keys: List[str], config_map: Mapping[str, str],
+) -> List[str]:
+    """Keep explicit channel keys first, with MODELFLARE_KEY as its shorthand."""
+    if api_keys or channel_name.strip().lower() != "modelflare":
+        return api_keys
+    return [key.strip() for key in (config_map.get("MODELFLARE_KEY") or "").split(',') if key.strip()]
+
+
+def resolve_llm_channel_models(
+    channel_name: str,
+    models: List[str],
+    *,
+    channel_names: str,
+    primary_model: str = "",
+    fallback_models: str = "",
+) -> List[str]:
+    """Resolve explicit routes or the default for a single Modelflare channel."""
+    if models:
+        return models
+    names = [name.strip().lower() for name in channel_names.split(',') if name.strip()]
+    primary = primary_model.strip() or MODELFLARE_LLM_MODEL_DEFAULT
+    if (names != ["modelflare"] or channel_name.strip().lower() != "modelflare"
+            or not primary.startswith("openai/") or not primary[7:].strip()):
+        return []
+    routes = [primary] + [model.strip() for model in fallback_models.split(',')]
+    return list(dict.fromkeys(
+        route for route in routes if route.startswith("openai/") and route[7:].strip()
+    ))
+
+
 def resolve_llm_channel_protocol(
     protocol: Optional[str],
     *,
@@ -509,6 +593,11 @@ def resolve_llm_channel_protocol(
     explicit = canonicalize_llm_channel_protocol(protocol)
     if explicit in SUPPORTED_LLM_CHANNEL_PROTOCOLS:
         return explicit
+
+    # These gateways are OpenAI-compatible; vendor/model IDs (anthropic/...,
+    # vertex/...) are not LiteLLM protocol declarations.
+    if is_vendor_model_gateway_base_url(base_url):
+        return "openai"
 
     for model in models or []:
         if "/" not in model:
@@ -524,8 +613,8 @@ def resolve_llm_channel_protocol(
             return name_protocol
 
     if base_url:
-        parsed = urlparse(base_url)
-        if parsed.hostname in {"127.0.0.1", "localhost", "0.0.0.0"}:
+        parsed = _safe_urlparse(base_url)
+        if parsed is not None and parsed.hostname in {"127.0.0.1", "localhost", "0.0.0.0"}:
             # Default to openai for local servers (vLLM, LM Studio, LocalAI, etc.).
             # Ollama users should set PROTOCOL=ollama explicitly or name the channel "ollama".
             return "openai"
@@ -539,8 +628,39 @@ def channel_allows_empty_api_key(protocol: Optional[str], base_url: Optional[str
     resolved_protocol = resolve_llm_channel_protocol(protocol, base_url=base_url)
     if resolved_protocol == "ollama":
         return True
-    parsed = urlparse(base_url or "")
-    return parsed.hostname in {"127.0.0.1", "localhost", "0.0.0.0"}
+    parsed = _safe_urlparse(base_url)
+    return parsed is not None and parsed.hostname in {"127.0.0.1", "localhost", "0.0.0.0"}
+
+
+def is_vendor_model_gateway_base_url(base_url: Optional[str]) -> bool:
+    """Identify gateways whose vendor/model IDs must use the OpenAI handler."""
+    raw_url = (base_url or "").strip()
+    if not raw_url:
+        return False
+    try:
+        hostname = (urlparse(raw_url).hostname or "").lower()
+    except ValueError:
+        return False
+    return (
+        hostname == "requesty.ai" or hostname.endswith(".requesty.ai")
+        or hostname == "api.x6.ai"
+    )
+
+
+def route_discovered_llm_model(model_id: str, base_url: Optional[str]) -> str:
+    """Return the saved channel value for an ID listed by a gateway ``/models``.
+
+    Requesty and x6.ai list ``vendor/model`` IDs (``openai/gpt-4o-mini``,
+    ``anthropic/claude-sonnet-4-6``, ``vertex/claude-sonnet-4-5``) and managed
+    policy IDs without a slash. The vendor segment collides with LiteLLM
+    provider names, so the saved value carries the OpenAI-compatible gateway
+    route once (``openai/openai/gpt-4o-mini``); LiteLLM strips that layer and
+    sends the full gateway ID unchanged.
+    """
+    normalized_id = (model_id or "").strip()
+    if not normalized_id or not is_vendor_model_gateway_base_url(base_url):
+        return normalized_id
+    return f"openai/{normalized_id}"
 
 
 def normalize_llm_channel_model(model: str, protocol: Optional[str], base_url: Optional[str] = None) -> str:
@@ -550,6 +670,17 @@ def normalize_llm_channel_model(model: str, protocol: Optional[str], base_url: O
         return normalized_model
 
     resolved_protocol = resolve_llm_channel_protocol(protocol, base_url=base_url, models=[normalized_model])
+
+    if (
+        "/" in normalized_model
+        and resolved_protocol == "openai"
+        and is_vendor_model_gateway_base_url(base_url)
+        and normalized_model.split("/", 1)[0].lower() != "openai"
+    ):
+        # Gateway vendor IDs such as anthropic/... or vertex/... must stay
+        # intact behind the OpenAI-compatible gateway route instead of being
+        # read as LiteLLM direct providers.
+        return f"openai/{normalized_model}"
 
     if "/" in normalized_model:
         # The model already has a slash, e.g. 'deepseek-ai/DeepSeek-V3'.
@@ -830,6 +961,9 @@ def setup_env(override: bool = False):
                   system environment variables take precedence.
     """
     Config._capture_bootstrap_runtime_env_overrides()
+    from src.utils.mini_racer_guard import ensure_mini_racer_thread_safety
+
+    ensure_mini_racer_thread_safety()
     # src/config.py -> src/ -> root
     env_file = os.getenv("ENV_FILE")
     if env_file:
@@ -879,11 +1013,18 @@ class Config:
 
     # === 数据源 API Token ===
     tushare_token: Optional[str] = None
+    tickplus_api_key: Optional[str] = None
+    tickplus_priority: int = 0
     tickflow_api_key: Optional[str] = None
     tickflow_kline_adjust: str = "none"
     tickflow_priority: int = 2
     tickflow_batch_daily_enabled: bool = True
     tickflow_batch_size: int = 100
+    futu_opend_host: Optional[str] = None
+    futu_opend_port: int = 11111
+    futu_hk_realtime_source_priority: str = "futu,longbridge,akshare,yfinance"
+    mx_apikey: Optional[str] = None
+    mx_priority: int = 6
     finnhub_api_key: Optional[str] = None
     alphavantage_api_key: Optional[str] = None
     longbridge_app_key: Optional[str] = None
@@ -903,7 +1044,7 @@ class Config:
     generation_backend_max_concurrency: int = DEFAULT_GENERATION_BACKEND_MAX_CONCURRENCY
     local_cli_backend_max_concurrency: int = DEFAULT_LOCAL_CLI_BACKEND_MAX_CONCURRENCY
     opencode_cli_model: str = ""
-    # LiteLLM unified model config (provider/model format, e.g. gemini/gemini-3.1-pro-preview)
+    # LiteLLM unified model config (provider/model format, e.g. gemini/gemini-3.6-flash)
     litellm_model: str = ""  # Primary model; must include provider prefix when set explicitly
     litellm_fallback_models: List[str] = field(default_factory=list)  # Cross-model fallback list
 
@@ -942,8 +1083,8 @@ class Config:
 
     # Legacy single-key fields (kept for backward compatibility; gemini_api_keys[0] when set)
     gemini_api_key: Optional[str] = None
-    gemini_model: str = "gemini-3.1-pro-preview"  # 主模型
-    gemini_model_fallback: str = "gemini-3-flash-preview"  # 备选模型
+    gemini_model: str = "gemini-3.6-flash"  # 主模型
+    gemini_model_fallback: str = "gemini-3.5-flash-lite"  # 备选模型
     gemini_temperature: float = 0.7  # 温度参数（0.0-2.0，控制输出随机性，默认0.7）
 
     # Gemini API 请求配置（防止 429 限流）
@@ -960,13 +1101,13 @@ class Config:
     # OpenAI 兼容 API（备选，当 Gemini/Anthropic 不可用时使用）
     openai_api_key: Optional[str] = None
     openai_base_url: Optional[str] = None  # 如: https://api.openai.com/v1
-    openai_model: str = "gpt-5.5"  # OpenAI 兼容模型名称
+    openai_model: str = "gpt-6.1-sol"  # OpenAI 兼容模型名称
     openai_vision_model: Optional[str] = None  # Deprecated: use VISION_MODEL instead
     openai_temperature: float = 0.7  # OpenAI 温度参数（0.0-2.0，默认0.7）
 
     # === Vision 配置 ===
     # VISION_MODEL: litellm model string used for image understanding calls.
-    # Fallback chain: VISION_MODEL → OPENAI_VISION_MODEL → gemini/gemini-2.0-flash
+    # Fallback chain: VISION_MODEL → OPENAI_VISION_MODEL → gemini/gemini-3.6-flash
     vision_model: str = ""
     # VISION_PROVIDER_PRIORITY: comma-separated provider order for Vision fallback.
     vision_provider_priority: str = "gemini,anthropic,openai"
@@ -979,7 +1120,8 @@ class Config:
     brave_api_keys: List[str] = field(default_factory=list)  # Brave Search API Keys
     serpapi_keys: List[str] = field(default_factory=list)  # SerpAPI Keys
     searxng_base_urls: List[str] = field(default_factory=list)  # SearXNG instance URLs (self-hosted, no quota)
-    searxng_public_instances_enabled: bool = True  # Auto-discover public SearXNG instances when base URLs are absent
+    searxng_public_instances_enabled: bool = False  # Opt in to public discovery when base URLs are absent
+    searxng_timeout_seconds: int = 10  # 自建 SearXNG 单次搜索超时（秒）
 
     # === Social Sentiment (US stocks only, api.adanos.org) ===
     social_sentiment_api_key: Optional[str] = None
@@ -1023,6 +1165,7 @@ class Config:
     agent_action_tool_timeout_s: float = 0.0
     agent_skill_concurrency: int = 3
     agent_risk_override: bool = True  # Allow risk agent to veto buy signals
+    agent_debate_enabled: bool = False  # Opt-in conditional Bull/Bear evidence debate on disagreement or high-conviction buy
     agent_deep_research_budget: int = 30000  # Max token budget for deep research
     agent_deep_research_timeout: int = 180  # Max seconds for /research command before returning timeout
     agent_memory_enabled: bool = False  # Enable memory & calibration system
@@ -1179,8 +1322,18 @@ class Config:
     backtest_enabled: bool = True
     backtest_eval_window_days: int = 10
     backtest_min_age_days: int = 14
-    backtest_engine_version: str = "v1"
+    backtest_engine_version: str = "v1.1"
     backtest_neutral_band_pct: float = 2.0
+
+    # === ETF 轮动配置（仅 --etf-rotation 使用）===
+    etf_rotation_pool: List[str] = field(default_factory=lambda: list(DEFAULT_ETF_ROTATION_POOL))
+    etf_rotation_safe_asset: str = DEFAULT_ETF_ROTATION_SAFE_ASSET
+    etf_rotation_lookback_days: int = 60
+    etf_rotation_rebalance: str = "weekly"
+    etf_rotation_top_n: int = 2
+    etf_rotation_switch_buffer_pct: float = 2.0
+    etf_rotation_cost_bps: float = 10.0
+    etf_rotation_backtest_years: int = 8
     
     # === 日志配置 ===
     log_dir: str = "./logs"  # 日志文件目录
@@ -1188,6 +1341,7 @@ class Config:
     
     # === 系统配置 ===
     max_workers: int = 3  # 低并发防封禁
+    per_stock_timeout_seconds: int = 300  # 单股超时隔离上限（秒，0 表示不限时）
     debug: bool = False
     http_proxy: Optional[str] = None  # HTTP 代理 (例如: http://127.0.0.1:10809)
     https_proxy: Optional[str] = None # HTTPS 代理
@@ -1197,10 +1351,20 @@ class Config:
     schedule_time: str = "18:00"              # 每日推送时间（HH:MM 格式）
     schedule_times: List[str] = field(default_factory=lambda: ["18:00"])
     schedule_run_immediately: bool = True     # 启动时是否立即执行一次
+    # 定时模式启动立即执行的当日去重开关：当天已有成功全量分析记录时跳过启动补跑；
+    # 设为 false 可完全旁路该行为（回到上游"每次启动都立即执行"的现状）
+    schedule_startup_dedup: bool = True
     run_immediately: bool = True              # 启动时是否立即执行一次（非定时模式）
     market_review_enabled: bool = True        # 是否启用大盘复盘
     daily_market_context_enabled: bool = True   # 是否将大盘环境摘要用于个股分析 Prompt 与保守护栏
-    # 大盘复盘市场区域：cn(A股)、hk(港股)、us(美股)、jp(日股)、kr(韩股)、both(全部市场)
+    # 跨资产外围上下文（Issue #1910）：默认关闭（opt-in），显式开启后才注入低敏摘要；
+    # 不配置时分析主流程零行为差异
+    cross_asset_context_enabled: bool = False
+    # 跨资产上下文单次组装总预算（秒）；超时未取到的资产组记 error=timeout，不影响主分析
+    cross_asset_context_timeout_seconds: int = 8
+    # 收盘数据 stale 判定天数（指数/利率按交易日+1 自然日判定）
+    cross_asset_context_stale_days: int = 2
+    # 大盘复盘市场区域：cn(A股)、hk(港股)、us(美股)、jp(日股)、kr(韩股)、tw(台股)、both(全部市场)
     market_review_region: str = "cn"
     market_review_color_scheme: str = "green_up"
     # 交易日检查：默认启用，非交易日跳过执行；设为 false 或 --force-run 可强制执行（Issue #373）
@@ -1292,6 +1456,12 @@ class Config:
     wecom_token: Optional[str] = None               # 回调 Token
     wecom_encoding_aes_key: Optional[str] = None    # 消息加解密密钥
     wecom_agent_id: Optional[str] = None            # 应用 AgentId
+
+    # 企业微信智能机器人（WebSocket 长连接模式，Issue #755 Phase 1，默认关）
+    wecom_aibot_enabled: bool = False               # 是否启用长连接模式（无需公网IP）
+    wecom_aibot_bot_id: Optional[str] = None        # 智能机器人 Bot ID
+    wecom_aibot_secret: Optional[str] = None        # 长连接专用 Secret
+    wecom_aibot_reply_stream: bool = False          # 是否用 stream 流式回复（默认关）
     
     # Telegram 机器人 - 已有 telegram_bot_token, telegram_chat_id
     telegram_webhook_secret: Optional[str] = None   # Webhook 密钥
@@ -1313,6 +1483,11 @@ class Config:
             "SCHEDULE_TIME",
             "SCHEDULE_TIMES",
             "SCHEDULE_RUN_IMMEDIATELY",
+            # Same startup-key treatment as SCHEDULE_RUN_IMMEDIATELY: a
+            # bootstrap process env value (docker -e / compose / shell
+            # export) that differs from the persisted .env must win, while
+            # a WebUI .env edit still takes effect on reload (PR #2366).
+            "SCHEDULE_STARTUP_DEDUP",
         }
     )
     _BOOTSTRAP_RUNTIME_ENV_OVERRIDES_CAPTURED = False
@@ -1506,12 +1681,11 @@ class Config:
         # the higher-priority sources and Hermes blocking issues are known.
         litellm_model_explicit = os.getenv('LITELLM_MODEL', '').strip()
         litellm_model = litellm_model_explicit
-        inferred_legacy_deepseek_model = False
         _openai_model_env = os.getenv('OPENAI_MODEL', '').strip()
         if using_anspire_llm_legacy:
             _openai_model_name = _anspire_llm_model_env or _openai_model_env or ANSPIRE_LLM_MODEL_DEFAULT
         else:
-            _openai_model_name = _openai_model_env or 'gpt-5.5'
+            _openai_model_name = _openai_model_env or 'gpt-6.1-sol'
 
         # LITELLM_FALLBACK_MODELS: comma-separated list of fallback models
         _fallback_str = os.getenv('LITELLM_FALLBACK_MODELS', '')
@@ -1533,13 +1707,14 @@ class Config:
 
         # Priority 1: LITELLM_CONFIG (standard LiteLLM YAML config file)
         if litellm_config_path:
-            llm_model_list = cls._parse_litellm_yaml(litellm_config_path)
-            if llm_model_list:
+            parsed_yaml_models = cls._parse_litellm_yaml(litellm_config_path)
+            if get_configured_llm_models(parsed_yaml_models):
+                llm_model_list = parsed_yaml_models
                 llm_models_source = "litellm_config"
 
         # Priority 2: LLM_CHANNELS (env var based channel config)
         if not llm_model_list:
-            _channels_str = os.getenv('LLM_CHANNELS', '').strip()
+            _channels_str = resolve_llm_channel_names(os.environ)
             if _channels_str:
                 llm_channel_names = [
                     ch.strip().lower()
@@ -1580,15 +1755,14 @@ class Config:
                 llm_models_source = "legacy_env"
 
             if not litellm_model:
-                _gemini_model_name = os.getenv('GEMINI_MODEL', 'gemini-3.1-pro-preview').strip()
+                _gemini_model_name = os.getenv('GEMINI_MODEL', 'gemini-3.6-flash').strip()
                 _anthropic_model_name = os.getenv('ANTHROPIC_MODEL', 'claude-sonnet-4-6').strip()
                 if gemini_api_keys:
                     litellm_model = f'gemini/{_gemini_model_name}'
                 elif anthropic_api_keys:
                     litellm_model = f'anthropic/{_anthropic_model_name}'
                 elif deepseek_api_keys:
-                    litellm_model = 'deepseek/deepseek-chat'
-                    inferred_legacy_deepseek_model = True
+                    litellm_model = 'deepseek/deepseek-v4-flash'
                 elif openai_api_keys:
                     # For openai-compatible models, add prefix only if not already prefixed
                     if '/' not in _openai_model_name:
@@ -1598,21 +1772,10 @@ class Config:
 
             if not litellm_fallback_models and not litellm_fallback_models_explicit:
                 # Backward compat: use gemini_model_fallback when primary is gemini
-                _gemini_fallback = os.getenv('GEMINI_MODEL_FALLBACK', 'gemini-3-flash-preview').strip()
+                _gemini_fallback = os.getenv('GEMINI_MODEL_FALLBACK', 'gemini-3.5-flash-lite').strip()
                 if litellm_model.startswith('gemini/') and _gemini_fallback:
                     _fb = f'gemini/{_gemini_fallback}' if '/' not in _gemini_fallback else _gemini_fallback
                     litellm_fallback_models = [_fb]
-
-        if (
-            inferred_legacy_deepseek_model
-            and llm_models_source == "legacy_env"
-            and litellm_model == 'deepseek/deepseek-chat'
-        ):
-            logger.warning(
-                "Deprecation warning:\n"
-                "deepseek-chat will be deprecated on 2026-07-24,\n"
-                "please migrate to deepseek-v4-flash."
-            )
 
         generation_backend = (
             os.getenv('GENERATION_BACKEND', LITELLM_BACKEND_ID).strip().lower()
@@ -1702,19 +1865,19 @@ class Config:
         searxng_base_urls = []
         invalid_searxng_urls = []
         for u in _raw_urls:
-            p = urlparse(u)
-            if p.scheme in ('http', 'https') and p.netloc:
+            p = _safe_urlparse(u)
+            if p is not None and p.scheme in ('http', 'https') and p.netloc:
                 searxng_base_urls.append(u)
             else:
                 invalid_searxng_urls.append(u)
         if invalid_searxng_urls:
             logger.warning(
-                "SEARXNG_BASE_URLS 中存在无效 URL，已忽略: %s",
-                ", ".join(invalid_searxng_urls[:3]),
+                "SEARXNG_BASE_URLS 中存在无效 URL，已忽略（数量: %d）",
+                len(invalid_searxng_urls),
             )
         searxng_public_instances_enabled = parse_env_bool(
             os.getenv('SEARXNG_PUBLIC_INSTANCES_ENABLED'),
-            default=True,
+            default=False,
         )
 
         # 企微消息类型与最大字节数逻辑
@@ -1764,6 +1927,18 @@ class Config:
                 if schedule_run_immediately_env is not None
                 else legacy_run_immediately
             )
+        # Startup-immediate run daily dedup switch (schedule mode only).
+        # Unset keeps the dedup enabled; explicit "false" restores the
+        # upstream "run on every startup" behavior.
+        schedule_startup_dedup_env = cls._resolve_env_value(
+            'SCHEDULE_STARTUP_DEDUP',
+            prefer_env_file=True,
+        )
+        schedule_startup_dedup = (
+            schedule_startup_dedup_env.lower() == 'true'
+            if schedule_startup_dedup_env is not None
+            else True
+        )
         schedule_time_value = cls._resolve_env_value(
             'SCHEDULE_TIME',
             default='18:00',
@@ -1789,11 +1964,18 @@ class Config:
             feishu_app_secret=os.getenv('FEISHU_APP_SECRET'),
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),
             tushare_token=os.getenv('TUSHARE_TOKEN'),
+            tickplus_api_key=os.getenv('TICKPLUS_API_KEY'),
+            tickplus_priority=parse_env_int(os.getenv('TICKPLUS_PRIORITY'), 0, field_name='TICKPLUS_PRIORITY', minimum=0),
             tickflow_api_key=os.getenv('TICKFLOW_API_KEY'),
             tickflow_kline_adjust=normalize_tickflow_kline_adjust(os.getenv('TICKFLOW_KLINE_ADJUST')),
             tickflow_priority=parse_env_int(os.getenv('TICKFLOW_PRIORITY'), 2, field_name='TICKFLOW_PRIORITY', minimum=0),
             tickflow_batch_daily_enabled=parse_env_bool(os.getenv('TICKFLOW_BATCH_DAILY_ENABLED'), default=True),
             tickflow_batch_size=parse_env_int(os.getenv('TICKFLOW_BATCH_SIZE'), 100, field_name='TICKFLOW_BATCH_SIZE', minimum=1),
+            futu_opend_host=os.getenv('FUTU_OPEND_HOST') or None,
+            futu_opend_port=parse_env_int(os.getenv('FUTU_OPEND_PORT'), 11111, field_name='FUTU_OPEND_PORT', minimum=1, maximum=65535),
+            futu_hk_realtime_source_priority=os.getenv('FUTU_HK_REALTIME_SOURCE_PRIORITY', 'futu,longbridge,akshare,yfinance'),
+            mx_apikey=os.getenv('MX_APIKEY') or None,
+            mx_priority=parse_env_int(os.getenv('MX_PRIORITY'), 6, field_name='MX_PRIORITY', minimum=0),
             finnhub_api_key=os.getenv('FINNHUB_API_KEY') or None,
             alphavantage_api_key=os.getenv('ALPHAVANTAGE_API_KEY') or None,
             longbridge_app_key=os.getenv('LONGBRIDGE_APP_KEY') or None,
@@ -1838,8 +2020,8 @@ class Config:
             openai_api_keys=openai_api_keys,
             deepseek_api_keys=deepseek_api_keys,
             gemini_api_key=os.getenv('GEMINI_API_KEY'),
-            gemini_model=os.getenv('GEMINI_MODEL', 'gemini-3.1-pro-preview'),
-            gemini_model_fallback=os.getenv('GEMINI_MODEL_FALLBACK', 'gemini-3-flash-preview'),
+            gemini_model=os.getenv('GEMINI_MODEL', 'gemini-3.6-flash'),
+            gemini_model_fallback=os.getenv('GEMINI_MODEL_FALLBACK', 'gemini-3.5-flash-lite'),
             gemini_temperature=parse_env_float(os.getenv('GEMINI_TEMPERATURE'), 0.7, field_name='GEMINI_TEMPERATURE'),
             gemini_request_delay=parse_env_float(os.getenv('GEMINI_REQUEST_DELAY'), 2.0, field_name='GEMINI_REQUEST_DELAY', minimum=0.0),
             gemini_max_retries=parse_env_int(os.getenv('GEMINI_MAX_RETRIES'), 5, field_name='GEMINI_MAX_RETRIES', minimum=0),
@@ -1853,7 +2035,7 @@ class Config:
             # Overall provider fallback order: Gemini > Anthropic > OpenAI-compatible (incl. AIHubmix).
             # base_url is auto-set to aihubmix.com/v1 when AIHUBMIX_KEY is used and no explicit
             # OPENAI_BASE_URL override is provided.
-            # Model names match upstream (e.g. gemini-3.1-pro-preview, gpt-5.5, deepseek-v4-flash).
+            # Model names match upstream (e.g. gemini-3.6-flash, gpt-6.1-sol, deepseek-v4-flash).
             openai_api_key=openai_api_keys[0] if openai_api_keys else None,
             openai_base_url=openai_base_url,
             openai_model=_openai_model_name,
@@ -1874,6 +2056,9 @@ class Config:
             serpapi_keys=serpapi_keys,
             searxng_base_urls=searxng_base_urls,
             searxng_public_instances_enabled=searxng_public_instances_enabled,
+            searxng_timeout_seconds=parse_env_int(
+                os.getenv('SEARXNG_TIMEOUT_SECONDS'), 10, field_name='SEARXNG_TIMEOUT_SECONDS', minimum=1
+            ),
             social_sentiment_api_key=os.getenv('SOCIAL_SENTIMENT_API_KEY') or None,
             social_sentiment_api_url=os.getenv('SOCIAL_SENTIMENT_API_URL', 'https://api.adanos.org').rstrip('/'),
             news_max_age_days=parse_env_int(os.getenv('NEWS_MAX_AGE_DAYS'), 3, field_name='NEWS_MAX_AGE_DAYS', minimum=1),
@@ -1977,6 +2162,7 @@ class Config:
                 maximum=4,
             ),
             agent_risk_override=os.getenv('AGENT_RISK_OVERRIDE', 'true').lower() == 'true',
+            agent_debate_enabled=os.getenv('AGENT_DEBATE_ENABLED', 'false').lower() == 'true',
             agent_deep_research_budget=parse_env_int(
                 os.getenv('AGENT_DEEP_RESEARCH_BUDGET'),
                 30000,
@@ -2146,16 +2332,47 @@ class Config:
             backtest_enabled=os.getenv('BACKTEST_ENABLED', 'true').lower() == 'true',
             backtest_eval_window_days=parse_env_int(os.getenv('BACKTEST_EVAL_WINDOW_DAYS'), 10, field_name='BACKTEST_EVAL_WINDOW_DAYS', minimum=1),
             backtest_min_age_days=parse_env_int(os.getenv('BACKTEST_MIN_AGE_DAYS'), 14, field_name='BACKTEST_MIN_AGE_DAYS', minimum=1),
-            backtest_engine_version=os.getenv('BACKTEST_ENGINE_VERSION', 'v1'),
+            backtest_engine_version=os.getenv('BACKTEST_ENGINE_VERSION', 'v1.1'),
             backtest_neutral_band_pct=parse_env_float(
                 os.getenv('BACKTEST_NEUTRAL_BAND_PCT'),
                 2.0,
                 field_name='BACKTEST_NEUTRAL_BAND_PCT',
                 minimum=0.0,
             ),
+            etf_rotation_pool=cls._parse_etf_rotation_pool(os.getenv('ETF_ROTATION_POOL')),
+            etf_rotation_safe_asset=(
+                os.getenv('ETF_ROTATION_SAFE_ASSET', DEFAULT_ETF_ROTATION_SAFE_ASSET) or ''
+            ).strip(),
+            etf_rotation_lookback_days=parse_env_int(
+                os.getenv('ETF_ROTATION_LOOKBACK_DAYS'), 60,
+                field_name='ETF_ROTATION_LOOKBACK_DAYS', minimum=5, maximum=500,
+            ),
+            etf_rotation_rebalance=cls._parse_etf_rotation_rebalance(os.getenv('ETF_ROTATION_REBALANCE')),
+            etf_rotation_top_n=parse_env_int(
+                os.getenv('ETF_ROTATION_TOP_N'), 2,
+                field_name='ETF_ROTATION_TOP_N', minimum=1, maximum=10,
+            ),
+            etf_rotation_switch_buffer_pct=parse_env_float(
+                os.getenv('ETF_ROTATION_SWITCH_BUFFER_PCT'), 2.0,
+                field_name='ETF_ROTATION_SWITCH_BUFFER_PCT', minimum=0.0, maximum=50.0,
+            ),
+            etf_rotation_cost_bps=parse_env_float(
+                os.getenv('ETF_ROTATION_COST_BPS'), 10.0,
+                field_name='ETF_ROTATION_COST_BPS', minimum=0.0, maximum=500.0,
+            ),
+            etf_rotation_backtest_years=parse_env_int(
+                os.getenv('ETF_ROTATION_BACKTEST_YEARS'), 8,
+                field_name='ETF_ROTATION_BACKTEST_YEARS', minimum=1, maximum=30,
+            ),
             log_dir=os.getenv('LOG_DIR', './logs'),
             log_level=os.getenv('LOG_LEVEL', 'INFO'),
             max_workers=parse_env_int(os.getenv('MAX_WORKERS'), 3, field_name='MAX_WORKERS', minimum=1),
+            per_stock_timeout_seconds=parse_env_int(
+                os.getenv('PER_STOCK_TIMEOUT_SECONDS'),
+                300,
+                field_name='PER_STOCK_TIMEOUT_SECONDS',
+                minimum=0,
+            ),
             debug=os.getenv('DEBUG', 'false').lower() == 'true',
             config_validate_mode=os.getenv('CONFIG_VALIDATE_MODE', 'warn').lower(),
             http_proxy=os.getenv('HTTP_PROXY'),
@@ -2171,9 +2388,25 @@ class Config:
                 fallback_time=(schedule_time_value or '18:00').strip() or '18:00',
             ),
             schedule_run_immediately=schedule_run_immediately,
+            schedule_startup_dedup=schedule_startup_dedup,
             run_immediately=legacy_run_immediately,
             market_review_enabled=os.getenv('MARKET_REVIEW_ENABLED', 'true').lower() == 'true',
             daily_market_context_enabled=os.getenv('DAILY_MARKET_CONTEXT_ENABLED', 'true').lower() == 'true',
+            cross_asset_context_enabled=os.getenv('CROSS_ASSET_CONTEXT_ENABLED', 'false').lower() == 'true',
+            cross_asset_context_timeout_seconds=parse_env_int(
+                os.getenv('CROSS_ASSET_CONTEXT_TIMEOUT_SECONDS'),
+                8,
+                field_name='CROSS_ASSET_CONTEXT_TIMEOUT_SECONDS',
+                minimum=1,
+                maximum=120,
+            ),
+            cross_asset_context_stale_days=parse_env_int(
+                os.getenv('CROSS_ASSET_CONTEXT_STALE_DAYS'),
+                2,
+                field_name='CROSS_ASSET_CONTEXT_STALE_DAYS',
+                minimum=1,
+                maximum=30,
+            ),
             market_review_region=cls._parse_market_review_region(
                 os.getenv('MARKET_REVIEW_REGION', 'cn')
             ),
@@ -2203,6 +2436,11 @@ class Config:
             wecom_token=os.getenv('WECOM_TOKEN'),
             wecom_encoding_aes_key=os.getenv('WECOM_ENCODING_AES_KEY'),
             wecom_agent_id=os.getenv('WECOM_AGENT_ID'),
+            # 企业微信智能机器人（WebSocket 长连接，默认关）
+            wecom_aibot_enabled=os.getenv('WECOM_AIBOT_ENABLED', 'false').lower() == 'true',
+            wecom_aibot_bot_id=os.getenv('WECOM_AIBOT_BOT_ID'),
+            wecom_aibot_secret=os.getenv('WECOM_AIBOT_SECRET'),
+            wecom_aibot_reply_stream=os.getenv('WECOM_AIBOT_REPLY_STREAM', 'false').lower() == 'true',
             # Telegram
             telegram_webhook_secret=os.getenv('TELEGRAM_WEBHOOK_SECRET'),
             # Discord 机器人扩展配置
@@ -2312,19 +2550,36 @@ class Config:
             _logger.warning(f"Failed to parse LITELLM_CONFIG: {e}")
             return []
 
+        if not isinstance(yaml_config, dict):
+            _logger.warning("LITELLM_CONFIG: root must be a mapping")
+            return []
         model_list = yaml_config.get('model_list', [])
         if not isinstance(model_list, list):
             _logger.warning("LITELLM_CONFIG: model_list must be a list")
             return []
 
-        # Resolve os.environ/ references in string params
+        valid_model_list: List[Dict[str, Any]] = []
         for entry in model_list:
+            if not isinstance(entry, dict):
+                continue
             params = entry.get('litellm_params', {})
-            for key in list(params.keys()):
-                val = params.get(key)
+            if params is not None and not isinstance(params, dict):
+                _logger.warning("LITELLM_CONFIG: skipping model entry with non-mapping litellm_params")
+                continue
+            resolved_params = params or {}
+            # Resolve os.environ/ references in string params
+            for key in list(resolved_params.keys()):
+                val = resolved_params.get(key)
                 if isinstance(val, str) and val.startswith('os.environ/'):
                     env_name = val.split('/', 1)[1]
-                    params[key] = os.getenv(env_name, '')
+                    resolved_params[key] = os.getenv(env_name, '')
+            route_name = str(entry.get('model_name') or '').strip()
+            wire_model = str(resolved_params.get('model') or '').strip()
+            if not route_name and not wire_model:
+                _logger.warning("LITELLM_CONFIG: skipping model entry without model_name or litellm_params.model")
+                continue
+            valid_model_list.append(entry)
+        model_list = valid_model_list
 
         _logger.info(f"LITELLM_CONFIG: loaded {len(model_list)} model deployment(s) from {path}")
         return model_list
@@ -2348,7 +2603,7 @@ class Config:
             LLM_AIHUBMIX_API_SURFACE=chat_completions
             LLM_AIHUBMIX_BASE_URL=https://aihubmix.com/v1
             LLM_AIHUBMIX_API_KEY=sk-xxx           (or LLM_AIHUBMIX_API_KEYS=k1,k2)
-            LLM_AIHUBMIX_MODELS=gpt-5.5,claude-sonnet-4-6
+            LLM_AIHUBMIX_MODELS=gpt-6.1-sol,claude-sonnet-4-6
             LLM_AIHUBMIX_ENABLED=true
         """
         import logging
@@ -2374,11 +2629,28 @@ class Config:
             ch_lower = ch_name.lower()
             ch_upper = ch_name.upper()
 
-            base_url = os.getenv(f'LLM_{ch_upper}_BASE_URL', '').strip() or None
+            base_url = resolve_llm_channel_base_url(
+                ch_name, os.getenv(f'LLM_{ch_upper}_BASE_URL', '')
+            ) or None
             if ch_lower == "anspire" and not base_url:
                 base_url = (
                     os.getenv('ANSPIRE_LLM_BASE_URL') or ANSPIRE_LLM_BASE_URL_DEFAULT
                 ).strip() or None
+            if base_url:
+                parsed_base_url = _safe_urlparse(base_url)
+                if (
+                    parsed_base_url is None
+                    or parsed_base_url.scheme.lower() not in {"http", "https"}
+                    or not parsed_base_url.netloc
+                ):
+                    issues.append(HermesConfigIssue(
+                        f"LLM_{ch_upper}_BASE_URL",
+                        "invalid_base_url",
+                        f"LLM_{ch_upper}_BASE_URL 不是有效的 http:// 或 https:// URL。",
+                    ))
+                    blocks_legacy_fallback = True
+                    _logger.warning("LLM_%s_BASE_URL is invalid; channel skipped", ch_upper)
+                    continue
             protocol_raw = os.getenv(f'LLM_{ch_upper}_PROTOCOL', '').strip()
             if ch_lower == "anspire" and not protocol_raw:
                 protocol_raw = "openai"
@@ -2398,10 +2670,16 @@ class Config:
             if not api_keys and ch_lower == "anspire":
                 anspire_keys_raw = os.getenv('ANSPIRE_API_KEYS', '')
                 api_keys = [k.strip() for k in anspire_keys_raw.split(',') if k.strip()]
+            api_keys = resolve_llm_channel_api_keys(ch_name, api_keys, os.environ)
 
             # Models
             models_raw = os.getenv(f'LLM_{ch_upper}_MODELS', '')
             raw_models = [m.strip() for m in models_raw.split(',') if m.strip()]
+            raw_models = resolve_llm_channel_models(
+                ch_name, raw_models, channel_names=channels_str,
+                primary_model=os.getenv('LITELLM_MODEL', ''),
+                fallback_models=os.getenv('LITELLM_FALLBACK_MODELS', ''),
+            )
             if not raw_models and ch_lower == "anspire":
                 anspire_model = (
                     os.getenv('ANSPIRE_LLM_MODEL') or ANSPIRE_LLM_MODEL_DEFAULT
@@ -2897,6 +3175,25 @@ class Config:
             news_strategy_profile=self.news_strategy_profile,
         )
 
+    @staticmethod
+    def _parse_etf_rotation_pool(value: Optional[str]) -> List[str]:
+        if value is None or not value.strip():
+            return list(DEFAULT_ETF_ROTATION_POOL)
+        codes: List[str] = []
+        for raw in value.split(','):
+            code = raw.strip()
+            if code and code not in codes:
+                codes.append(code)
+        return codes
+
+    @staticmethod
+    def _parse_etf_rotation_rebalance(value: Optional[str]) -> str:
+        normalized = (value or 'weekly').strip().lower()
+        if normalized in ('weekly', 'monthly'):
+            return normalized
+        logger.warning("ETF_ROTATION_REBALANCE=%r is invalid; falling back to weekly", value)
+        return 'weekly'
+
     @classmethod
     def _parse_market_review_region(cls, value: str) -> str:
         """解析大盘复盘市场区域，非法值记录警告后回退为 cn"""
@@ -2905,7 +3202,7 @@ class Config:
             return normalized
 
         logging.getLogger(__name__).warning(
-            f"MARKET_REVIEW_REGION 配置值 '{value}' 无效，已回退为默认值 'cn'（合法值：cn / hk / us / jp / kr / both；支持逗号分隔有效值）"
+            f"MARKET_REVIEW_REGION 配置值 '{value}' 无效，已回退为默认值 'cn'（合法值：cn / hk / us / jp / kr / tw / both；支持逗号分隔有效值）"
         )
         return 'cn'
 
@@ -2939,7 +3236,7 @@ class Config:
     @classmethod
     def _resolve_realtime_source_priority(cls) -> str:
         """
-        Resolve realtime source priority with automatic tushare injection.
+        Resolve realtime source priority with configured paid-provider injection.
 
         When TUSHARE_TOKEN is configured but REALTIME_SOURCE_PRIORITY is not
         explicitly set, automatically prepend 'tushare' to the default priority
@@ -2951,6 +3248,10 @@ class Config:
         if explicit:
             # User explicitly set priority, respect it
             return explicit
+
+        if os.getenv('TICKPLUS_API_KEY', '').strip():
+            tushare = 'tushare,' if os.getenv('TUSHARE_TOKEN', '').strip() else ''
+            return f'tickplus,{tushare}{default_priority}'
 
         tushare_token = os.getenv('TUSHARE_TOKEN', '').strip()
         if tushare_token:
@@ -3161,22 +3462,19 @@ class Config:
                 ),
                 field="AGENT_GENERATION_BACKEND",
             ))
-        if agent_backend not in SUPPORTED_AGENT_BACKENDS:
+        if agent_backend == "codex_app_server":
+            issues.append(ConfigIssue(
+                severity="warning",
+                message=AGENT_BACKEND_REMOVED_MESSAGE,
+                field="AGENT_BACKEND",
+                code="backend_removed",
+            ))
+        elif agent_backend not in SUPPORTED_AGENT_BACKENDS:
             issues.append(ConfigIssue(
                 severity="error",
-                message=(
-                    "AGENT_BACKEND 当前支持 auto、litellm、codex_app_server。"
-                    f"已配置的值为：{agent_backend}。"
-                ),
+                message=f"AGENT_BACKEND 当前支持 auto、litellm。已配置的值为：{agent_backend}。",
                 field="AGENT_BACKEND",
                 code="capability_unsupported",
-            ))
-        if agent_backend == "codex_app_server" and self.agent_arch != "single":
-            issues.append(ConfigIssue(
-                severity="error",
-                message="Codex 本地 Agent 当前只支持单 Agent 问股，请将 AGENT_ARCH 设为 single。",
-                field="AGENT_ARCH",
-                code="unsupported_agent_arch",
             ))
         litellm_model_lower = (self.litellm_model or "").strip().lower()
         local_model_prefix = next(
@@ -3254,9 +3552,9 @@ class Config:
                 issues.append(ConfigIssue(
                     severity="error",
                     message=(
-                        "未配置任何可用的 AI 模型接入。请至少配置 ANSPIRE_API_KEYS、"
-                        "AIHUBMIX_KEY、GEMINI_API_KEY、ANTHROPIC_API_KEY、"
-                        "OPENAI_API_KEY 或 DEEPSEEK_API_KEY 中的一个，或配置 "
+                        "未配置任何可用的 AI 模型接入。请至少配置 MODELFLARE_KEY、AIHUBMIX_KEY、"
+                        "GEMINI_API_KEY、ANTHROPIC_API_KEY、"
+                        "OPENAI_API_KEY、DEEPSEEK_API_KEY 或 ANSPIRE_API_KEYS 中的一个，或配置 "
                         "LITELLM_CONFIG / LLM_CHANNELS 可用模型渠道。"
                     ),
                     field="LITELLM_CONFIG",
@@ -3266,7 +3564,7 @@ class Config:
                 severity="info",
                 message=(
                     "尚未明确指定主模型，系统将自动从可用 API Key 推断。"
-                    "建议尽早配置主模型（格式如 gemini/gemini-3.1-pro-preview）"
+                    "建议尽早配置主模型（格式如 gemini/gemini-3.6-flash）"
                 ),
                 field="LITELLM_MODEL",
             ))
@@ -3423,6 +3721,7 @@ class Config:
         # --- Notification channels ---
         has_notification = bool(
             self.wechat_webhook_url
+            or self.dingtalk_webhook_url
             or self.feishu_webhook_url
             or (
                 (self.feishu_app_id or "")
@@ -3477,8 +3776,8 @@ class Config:
             raw_url = (value or "").strip()
             if not raw_url:
                 return
-            parsed = urlparse(raw_url)
-            if parsed.scheme.lower() in {"http", "https"} and parsed.netloc:
+            parsed = _safe_urlparse(raw_url)
+            if parsed is not None and parsed.scheme.lower() in {"http", "https"} and parsed.netloc:
                 return
             issues.append(ConfigIssue(
                 severity="warning",

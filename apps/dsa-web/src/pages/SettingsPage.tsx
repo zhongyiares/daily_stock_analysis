@@ -1,7 +1,9 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { CheckCircle2, ChevronDown, CircleAlert, CircleDashed, Clock, Play, Plus, RefreshCw, Trash2 } from 'lucide-react';
-import { useAuth, useSystemConfig } from '../hooks';
+import { CheckCircle2, ChevronDown, CircleAlert, CircleDashed, Clock, Play, Plus, RefreshCw, Search, Trash2, X } from 'lucide-react';
+import { useBlocker, useLocation } from 'react-router-dom';
+import type { Location } from 'react-router-dom';
+import { useAuth, useDesktopUpdate, useSystemConfig } from '../hooks';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
 import { createParsedApiError, getParsedApiError, type ParsedApiError } from '../api/error';
 import { analysisApi } from '../api/analysis';
@@ -25,7 +27,8 @@ import {
 } from '../components/settings';
 import { WEB_BUILD_INFO } from '../utils/constants';
 import { parseStockListValue } from '../utils/stockList';
-import { getCategoryDescription, getCategoryTitle } from '../utils/systemConfigI18n';
+import { getCategoryDescription, getCategoryTitle, getFieldDescriptionZh, getFieldTitleZh } from '../utils/systemConfigI18n';
+import { getSettingsHelpContent } from '../locales/settingsHelp';
 import type {
   ConfigValidationIssue,
   SchedulerStatusResponse,
@@ -36,57 +39,6 @@ import type {
   SystemConfigUpdateItem,
 } from '../types/systemConfig';
 import type { UiLanguage, UiTextKey } from '../i18n/uiText';
-
-type DesktopWindow = Window & {
-  dsaDesktop?: {
-    version?: unknown;
-    getUpdateState?: () => Promise<RawDesktopUpdateState>;
-    checkForUpdates?: () => Promise<RawDesktopUpdateState>;
-    installDownloadedUpdate?: () => Promise<boolean>;
-    openReleasePage?: (releaseUrl?: string) => Promise<boolean>;
-    onUpdateStateChange?: (listener: (state: RawDesktopUpdateState) => void) => (() => void) | void;
-  };
-};
-
-type DesktopUpdateState = {
-  status?: string;
-  updateMode?: string;
-  currentVersion?: string;
-  latestVersion?: string;
-  releaseUrl?: string;
-  checkedAt?: string;
-  publishedAt?: string;
-  message?: string;
-  releaseName?: string;
-  tagName?: string;
-  downloadPercent?: number | null;
-  downloadedBytes?: number | null;
-  totalBytes?: number | null;
-};
-
-type RawDesktopUpdateState = {
-  status?: unknown;
-  updateMode?: unknown;
-  currentVersion?: unknown;
-  latestVersion?: unknown;
-  releaseUrl?: unknown;
-  checkedAt?: unknown;
-  publishedAt?: unknown;
-  message?: unknown;
-  releaseName?: unknown;
-  tagName?: unknown;
-  downloadPercent?: unknown;
-  downloadedBytes?: unknown;
-  totalBytes?: unknown;
-};
-
-type DesktopUpdateNotice = {
-  title: string;
-  message: string;
-  variant: 'error' | 'success' | 'warning';
-  actionLabel?: string;
-  actionKind?: 'release' | 'install';
-};
 
 const LLM_CHANNEL_EDITOR_RUNTIME_KEYS = new Set([
   'LITELLM_MODEL',
@@ -127,6 +79,7 @@ const GENERATION_BACKEND_STATUS_KEYS = new Set([
   'DEEPSEEK_API_KEY',
   'DEEPSEEK_API_KEYS',
   'AIHUBMIX_KEY',
+  'MODELFLARE_KEY',
   'ANSPIRE_LLM_ENABLED',
   'ANSPIRE_LLM_BASE_URL',
   'ANSPIRE_LLM_MODEL',
@@ -186,132 +139,6 @@ function isPromptCacheAdvancedSetting(item: { key: string }) {
   return PROMPT_CACHE_ADVANCED_SETTING_KEYS.has(item.key);
 }
 
-function trimDesktopRuntimeString(value: unknown) {
-  return typeof value === 'string' ? value.trim() : '';
-}
-
-function normalizeDesktopRuntimeNumber(value: unknown) {
-  if (value === null || value === undefined || value === '') {
-    return null;
-  }
-  const numberValue = typeof value === 'number' ? value : Number(value);
-  return Number.isFinite(numberValue) ? numberValue : null;
-}
-
-function getDesktopRuntimeApi() {
-  if (typeof window === 'undefined') {
-    return undefined;
-  }
-
-  return (window as DesktopWindow).dsaDesktop;
-}
-
-function getDesktopAppVersion() {
-  return trimDesktopRuntimeString(getDesktopRuntimeApi()?.version);
-}
-
-function normalizeDesktopUpdateState(state: RawDesktopUpdateState | null | undefined) {
-  if (!state || typeof state !== 'object') {
-    return null;
-  }
-
-  return {
-    status: trimDesktopRuntimeString(state.status) || 'idle',
-    updateMode: trimDesktopRuntimeString(state.updateMode) || 'manual',
-    currentVersion: trimDesktopRuntimeString(state.currentVersion),
-    latestVersion: trimDesktopRuntimeString(state.latestVersion),
-    releaseUrl: trimDesktopRuntimeString(state.releaseUrl),
-    checkedAt: trimDesktopRuntimeString(state.checkedAt),
-    publishedAt: trimDesktopRuntimeString(state.publishedAt),
-    message: trimDesktopRuntimeString(state.message),
-    releaseName: trimDesktopRuntimeString(state.releaseName),
-    tagName: trimDesktopRuntimeString(state.tagName),
-    downloadPercent: normalizeDesktopRuntimeNumber(state.downloadPercent),
-    downloadedBytes: normalizeDesktopRuntimeNumber(state.downloadedBytes),
-    totalBytes: normalizeDesktopRuntimeNumber(state.totalBytes),
-  };
-}
-
-function getDesktopUpdateNotice(
-  state: DesktopUpdateState | null,
-  t: (key: UiTextKey, params?: Record<string, string | number>) => string,
-): DesktopUpdateNotice | null {
-  if (!state) {
-    return null;
-  }
-
-  if (state.status === 'update-available') {
-    const latestLabel = state.latestVersion || state.tagName || t('settings.desktopLatest');
-    const currentLabel = state.currentVersion || getDesktopAppVersion() || WEB_BUILD_INFO.version;
-    return {
-      title: t('settings.desktopUpdateAvailable'),
-      message: t('settings.desktopUpdateMessage', {
-        current: currentLabel,
-        latest: latestLabel,
-        message: state.message || t('settings.desktopUpdateReleaseMessage'),
-      }),
-      variant: 'warning' as const,
-      actionLabel: state.updateMode === 'auto' ? undefined : t('settings.desktopDownload'),
-      actionKind: state.updateMode === 'auto' ? undefined : 'release',
-    };
-  }
-
-  if (state.status === 'downloading') {
-    const percentText = typeof state.downloadPercent === 'number' ? `（${state.downloadPercent}%）` : '';
-    return {
-      title: t('settings.desktopDownloading'),
-      message: state.message || t('settings.desktopUpdateDownloadingMessage', { percent: percentText }),
-      variant: 'warning' as const,
-    };
-  }
-
-  if (state.status === 'update-downloaded') {
-    return {
-      title: t('settings.desktopDownloaded'),
-      message: state.message || t('settings.desktopUpdateDownloadedMessage'),
-      variant: 'success' as const,
-      actionLabel: t('settings.desktopInstall'),
-      actionKind: 'install',
-    };
-  }
-
-  if (state.status === 'installing') {
-    return {
-      title: t('settings.desktopInstalling'),
-      message: state.message || t('settings.desktopUpdateInstallingMessage'),
-      variant: 'warning' as const,
-    };
-  }
-
-  if (state.status === 'up-to-date') {
-    return {
-      title: t('settings.desktopUpToDate'),
-      message: state.message || t('settings.desktopUpToDateMessage'),
-      variant: 'success' as const,
-    };
-  }
-
-  if (state.status === 'checking') {
-    return {
-      title: t('settings.desktopChecking'),
-      message: state.message || t('settings.desktopUpdateCheckingMessage'),
-      variant: 'warning' as const,
-    };
-  }
-
-  if (state.status === 'error') {
-    return {
-      title: t('settings.desktopCheckError'),
-      message: state.message || t('settings.desktopUpdateErrorMessage'),
-      variant: 'error' as const,
-      actionLabel: state.updateMode === 'auto' && state.releaseUrl ? t('settings.desktopDownload') : undefined,
-      actionKind: state.updateMode === 'auto' && state.releaseUrl ? 'release' : undefined,
-    };
-  }
-
-  return null;
-}
-
 function formatEnvBackupFilename(isDesktopRuntime: boolean) {
   const now = new Date();
   const pad = (value: number) => value.toString().padStart(2, '0');
@@ -327,6 +154,104 @@ const SCHEDULER_SETTING_KEYS = new Set([
   'SCHEDULE_TIME',
   'SCHEDULE_TIMES',
   'SCHEDULE_RUN_IMMEDIATELY',
+]);
+const SYSTEM_HIDDEN_KEYS = new Set([
+  'ADMIN_AUTH_ENABLED',
+  ...SCHEDULER_SETTING_KEYS,
+]);
+const BASE_HIDDEN_KEYS = new Set([
+  'SCREENING_ENABLED',
+]);
+const AGENT_HIDDEN_KEYS = new Set(['AGENT_GENERATION_BACKEND']);
+const LLM_CHANNEL_KEY_RE = /^LLM_[A-Z0-9_]+_(PROTOCOL|API_SURFACE|BASE_URL|API_KEY|API_KEYS|MODELS|EXTRA_HEADERS|ENABLED)$/;
+const AI_MODEL_HIDDEN_KEYS = new Set([
+  'LLM_CHANNELS',
+  'LLM_TEMPERATURE',
+  'LITELLM_MODEL',
+  'AGENT_LITELLM_MODEL',
+  'LITELLM_FALLBACK_MODELS',
+  'AIHUBMIX_KEY',
+  'DEEPSEEK_API_KEY',
+  'DEEPSEEK_API_KEYS',
+  'GEMINI_API_KEY',
+  'GEMINI_API_KEYS',
+  'GEMINI_MODEL',
+  'GEMINI_MODEL_FALLBACK',
+  'GEMINI_TEMPERATURE',
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_API_KEYS',
+  'ANTHROPIC_MODEL',
+  'ANTHROPIC_TEMPERATURE',
+  'ANTHROPIC_MAX_TOKENS',
+  'OPENAI_API_KEY',
+  'OPENAI_API_KEYS',
+  'OPENAI_BASE_URL',
+  'OPENAI_MODEL',
+  'OPENAI_VISION_MODEL',
+  'OPENAI_TEMPERATURE',
+  'VISION_MODEL',
+]);
+
+// UI rendering rule only: keep channel-managed and legacy provider keys out
+// of both generic category views and cross-category search so edits stay
+// coordinated through LLMChannelEditor.
+function isItemHiddenInSettings(
+  category: string,
+  item: SystemConfigItem,
+  aiModelHasConfiguredChannels: boolean,
+  aiModelHasConfiguredYaml: boolean,
+): boolean {
+  if (category === 'base') {
+    return BASE_HIDDEN_KEYS.has(item.key);
+  }
+  if (category === 'system') {
+    return SYSTEM_HIDDEN_KEYS.has(item.key);
+  }
+  if (category === 'agent') {
+    return AGENT_HIDDEN_KEYS.has(item.key);
+  }
+  if (category === 'ai_model') {
+    if (item.key === 'LLM_CHANNELS') {
+      return true;
+    }
+    // A non-empty YAML path is not proof that LiteLLM loaded it. When the
+    // path is invalid, runtime falls back to channel configuration, so keep
+    // the channel list out of the generic editor/search path.
+    if (aiModelHasConfiguredChannels && LLM_CHANNEL_KEY_RE.test(item.key)) {
+      return true;
+    }
+    // A configured YAML path may be missing or invalid at runtime. In that
+    // case Config falls back to LLM_CHANNELS, so exposing legacy runtime
+    // fields would allow a stale Vision/primary-model reference to be edited
+    // independently of the channel editor.
+    if (aiModelHasConfiguredChannels && !aiModelHasConfiguredYaml && AI_MODEL_HIDDEN_KEYS.has(item.key)) {
+      return true;
+    }
+  }
+  return false;
+}
+const ESSENTIAL_SETTING_KEYS = new Set([
+  'STOCK_LIST',
+  'REPORT_LANGUAGE',
+  'MARKET_REVIEW_ENABLED',
+  'LLM_CHANNELS',
+  'MODELFLARE_KEY',
+  'AIHUBMIX_KEY',
+  'GEMINI_API_KEY',
+  'DEEPSEEK_API_KEY',
+  'OPENAI_API_KEY',
+  'ANTHROPIC_API_KEY',
+  'OLLAMA_API_BASE',
+  'TUSHARE_TOKEN',
+  'TICKPLUS_API_KEY',
+  'WECHAT_WEBHOOK_URL',
+  'FEISHU_WEBHOOK_URL',
+  'TELEGRAM_BOT_TOKEN',
+  'TELEGRAM_CHAT_ID',
+  'EMAIL_SENDER',
+  'SCHEDULE_ENABLED',
+  'SCHEDULE_TIME',
+  'AGENT_MODE',
 ]);
 
 function getConfigItem(items: SystemConfigItem[], key: string) {
@@ -372,6 +297,7 @@ type FirstRunSetupCardProps = {
   smokeSuccess: string;
   onRefresh: () => void | Promise<void>;
   onSelectCategory: (category: SystemConfigCategory) => void;
+  onEditStockList: () => void;
   onRunSmoke: () => void | Promise<void>;
   listSeparator: string;
   t: (key: UiTextKey, params?: Record<string, string | number>) => string;
@@ -388,6 +314,7 @@ const FirstRunSetupCard: React.FC<FirstRunSetupCardProps> = ({
   smokeSuccess,
   onRefresh,
   onSelectCategory,
+  onEditStockList,
   onRunSmoke,
   listSeparator,
   t,
@@ -501,7 +428,7 @@ const FirstRunSetupCard: React.FC<FirstRunSetupCardProps> = ({
           <Button type="button" variant="settings-secondary" size="sm" onClick={() => onSelectCategory('ai_model')}>
             {t('settings.setupGuideConfigureLlm')}
           </Button>
-          <Button type="button" variant="settings-secondary" size="sm" onClick={() => onSelectCategory('base')}>
+          <Button type="button" variant="settings-secondary" size="sm" onClick={() => onEditStockList()}>
             {t('settings.setupGuideAddStocks')}
           </Button>
           <Button type="button" variant="settings-secondary" size="sm" onClick={() => onSelectCategory('notification')}>
@@ -578,6 +505,7 @@ type SchedulerSettingsCardProps = {
   disabled: boolean;
   issueByKey: Record<string, ConfigValidationIssue[]>;
   statusRefreshToken: number;
+  draftResetToken: number;
   onChange: (key: string, value: string) => void;
   onSchedulerStateChange?: (payload: {
     runtimeEnabled: boolean | null;
@@ -592,6 +520,7 @@ const SchedulerSettingsCard: React.FC<SchedulerSettingsCardProps> = ({
   disabled,
   issueByKey,
   statusRefreshToken,
+  draftResetToken,
   onChange,
   onSchedulerStateChange,
   t,
@@ -607,7 +536,10 @@ const SchedulerSettingsCard: React.FC<SchedulerSettingsCardProps> = ({
   const [statusError, setStatusError] = useState<ParsedApiError | null>(null);
   const [runNowError, setRunNowError] = useState<ParsedApiError | null>(null);
   const [runNowSuccess, setRunNowSuccess] = useState('');
-  const [scheduleEnabledOverride, setScheduleEnabledOverride] = useState<boolean | null>(null);
+  const [scheduleEnabledDraft, setScheduleEnabledDraft] = useState<{ token: number; value: boolean } | null>(null);
+  const scheduleEnabledOverride = scheduleEnabledDraft?.token === draftResetToken
+    ? scheduleEnabledDraft.value
+    : null;
 
   const refreshSchedulerStatus = useCallback(async () => {
     setStatusError(null);
@@ -700,7 +632,7 @@ const SchedulerSettingsCard: React.FC<SchedulerSettingsCardProps> = ({
                     disabled={disabled || !scheduleEnabledItem?.schema?.isEditable}
                     onChange={(event) => {
                       const nextEnabled = Boolean(event.target.checked);
-                      setScheduleEnabledOverride(nextEnabled);
+                      setScheduleEnabledDraft({ token: draftResetToken, value: nextEnabled });
                       onChange('SCHEDULE_ENABLED', nextEnabled ? 'true' : 'false');
                     }}
                   />
@@ -854,6 +786,7 @@ const SchedulerSettingsCard: React.FC<SchedulerSettingsCardProps> = ({
 
 const SettingsPage: React.FC = () => {
   const { authEnabled, passwordChangeable } = useAuth();
+  const location = useLocation();
   const { language: uiLanguage, t } = useUiLanguage();
   const [envBackupActionError, setEnvBackupActionError] = useState<ParsedApiError | null>(null);
   const [envBackupActionSuccess, setEnvBackupActionSuccess] = useState<string>('');
@@ -863,8 +796,6 @@ const SettingsPage: React.FC = () => {
   const [isImportingEnv, setIsImportingEnv] = useState(false);
   const [isUpdatingScreening, setIsUpdatingScreening] = useState(false);
   const [showImportConfirm, setShowImportConfirm] = useState(false);
-  const [desktopUpdateState, setDesktopUpdateState] = useState<DesktopUpdateState | null>(null);
-  const [isCheckingDesktopUpdate, setIsCheckingDesktopUpdate] = useState(false);
   const [schedulerStatusRefreshToken, setSchedulerStatusRefreshToken] = useState(0);
   const [schedulerRuntimeEnabled, setSchedulerRuntimeEnabled] = useState<boolean | null>(null);
   const [schedulerOverrideFromUi, setSchedulerOverrideFromUi] = useState<boolean | null>(null);
@@ -874,15 +805,26 @@ const SettingsPage: React.FC = () => {
   const [isRunningSetupSmoke, setIsRunningSetupSmoke] = useState(false);
   const [setupSmokeError, setSetupSmokeError] = useState<ParsedApiError | null>(null);
   const [setupSmokeSuccess, setSetupSmokeSuccess] = useState('');
+  const [localDraftResetToken, setLocalDraftResetToken] = useState(0);
+  const [llmChannelHasDirty, setLlmChannelHasDirty] = useState(false);
+  const [llmChannelIsSaving, setLlmChannelIsSaving] = useState(false);
   const [llmChannelDraftItems, setLlmChannelDraftItems] = useState<SystemConfigUpdateItem[]>([]);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [settingsMode, setSettingsMode] = useState<'all' | 'essential'>('all');
   const envBackupImportRef = useRef<HTMLInputElement | null>(null);
   const setupStatusRequestIdRef = useRef(0);
-  const desktopRuntimeApi = getDesktopRuntimeApi();
-  const isDesktopRuntime = Boolean(desktopRuntimeApi);
-  const canCheckDesktopUpdate = Boolean(
-    desktopRuntimeApi?.getUpdateState && desktopRuntimeApi?.checkForUpdates && desktopRuntimeApi?.openReleasePage
-  );
-  const desktopAppVersion = getDesktopAppVersion();
+  const lastAppliedCategorySearchRef = useRef<string | null>(null);
+  const {
+    isDesktopRuntime,
+    canCheckDesktopUpdate,
+    desktopAppVersion,
+    isBusy: isDesktopUpdateBusy,
+    isChecking: isCheckingDesktopUpdate,
+    notice: desktopUpdateNotice,
+    checkForUpdates: handleDesktopUpdateCheck,
+    openReleasePage: openDesktopReleasePage,
+    installDownloadedUpdate: installDesktopUpdate,
+  } = useDesktopUpdate();
   const shouldShowDesktopVersionCard = Boolean(desktopAppVersion);
 
   // Set page title
@@ -914,6 +856,7 @@ const SettingsPage: React.FC = () => {
     refreshAfterExternalSave,
     configVersion,
     maskToken,
+    llmYamlActive,
     llmModelProviders,
   } = useSystemConfig();
 
@@ -975,11 +918,29 @@ const SettingsPage: React.FC = () => {
   }, [load]);
 
   useEffect(() => {
-    const requestedCategory = new URLSearchParams(window.location.search).get('category');
-    if (requestedCategory && categories.some((category) => category.category === requestedCategory)) {
+    const requestedCategory = new URLSearchParams(location.search).get('category');
+    if (!requestedCategory) {
+      lastAppliedCategorySearchRef.current = null;
+      return;
+    }
+    const navigationSignature = `${location.key}:${location.search}:${requestedCategory}`;
+    if (lastAppliedCategorySearchRef.current === navigationSignature) {
+      return;
+    }
+    if (categories.some((category) => category.category === requestedCategory)) {
+      lastAppliedCategorySearchRef.current = navigationSignature;
       setActiveCategory(requestedCategory);
     }
-  }, [categories, setActiveCategory]);
+  }, [categories, location.key, location.search, setActiveCategory]);
+
+  useEffect(() => {
+    if (isLoading || activeCategory !== 'system' || location.hash !== '#desktop-version-info') {
+      return;
+    }
+
+    const node = document.getElementById('desktop-version-info');
+    node?.scrollIntoView({ block: 'start' });
+  }, [activeCategory, isLoading, location.hash]);
 
   useEffect(() => {
     void refreshSetupStatus();
@@ -999,59 +960,20 @@ const SettingsPage: React.FC = () => {
     };
   }, [clearToast, toast]);
 
-  useEffect(() => {
-    if (!canCheckDesktopUpdate) {
-      setDesktopUpdateState(null);
-      setIsCheckingDesktopUpdate(false);
-      return;
-    }
-
-    let active = true;
-
-    const syncDesktopUpdateState = async () => {
-      try {
-        const state = await desktopRuntimeApi?.getUpdateState?.();
-        if (active) {
-          setDesktopUpdateState(normalizeDesktopUpdateState(state));
-        }
-      } catch (error: unknown) {
-        if (!active) {
-          return;
-        }
-        setDesktopUpdateState({
-          status: 'error',
-          message: error instanceof Error ? error.message : t('settings.desktopUpdateErrorMessage'),
-        });
-      }
-    };
-
-    void syncDesktopUpdateState();
-
-    const unsubscribe = desktopRuntimeApi?.onUpdateStateChange?.((state) => {
-      if (!active) {
-        return;
-      }
-      setDesktopUpdateState(normalizeDesktopUpdateState(state));
-      setIsCheckingDesktopUpdate(false);
-    });
-
-    return () => {
-      active = false;
-      if (typeof unsubscribe === 'function') {
-        unsubscribe();
-      }
-    };
-  }, [canCheckDesktopUpdate, desktopRuntimeApi, t]);
-
   const rawActiveItems = itemsByCategory[activeCategory] || [];
   const rawActiveItemMap = new Map(rawActiveItems.map((item) => [item.key, String(item.value ?? '')]));
+  const aiModelItems = itemsByCategory.ai_model || [];
+  const aiModelItemMap = new Map(aiModelItems.map((item) => [item.key, String(item.value ?? '')]));
   const firstSetupStockCode = parseSetupStockList(getConfigItem(itemsByCategory.base || [], 'STOCK_LIST')?.value)[0] || '';
   const screeningItem = (itemsByCategory.base || []).find((item) => item.key === 'SCREENING_ENABLED');
   const screeningEnabled = String(screeningItem?.value ?? '').trim().toLowerCase() === 'true';
   const shouldShowFirstRunSetup = activeCategory === 'base';
   const shouldShowScreeningSettings = activeCategory === 'base' && Boolean(screeningItem);
-  const hasConfiguredChannels = Boolean((rawActiveItemMap.get('LLM_CHANNELS') || '').trim());
-  const hasLitellmConfig = Boolean((rawActiveItemMap.get('LITELLM_CONFIG') || '').trim());
+  const aiModelHasConfiguredChannels = Boolean((aiModelItemMap.get('LLM_CHANNELS') || '').trim()
+    || (aiModelItemMap.get('MODELFLARE_KEY') || '').trim());
+  const aiModelYamlItem = aiModelItems.find((item) => item.key === 'LITELLM_CONFIG');
+  const aiModelHasConfiguredYaml = llmYamlActive ?? Boolean((aiModelYamlItem?.value || '').trim()
+    && aiModelYamlItem?.rawValueExists !== false);
   const hasRuntimeSchedulerMismatch =
     schedulerRuntimeEnabled !== null
     && schedulerOverrideFromUi !== null
@@ -1059,7 +981,57 @@ const SettingsPage: React.FC = () => {
   const hasRuntimeSchedulerMismatchInDraft = hasRuntimeSchedulerMismatch
     && !currentChangedItems.some((item) => item.key === 'SCHEDULE_ENABLED');
   const effectiveHasDirty = hasDirty || hasRuntimeSchedulerMismatchInDraft;
+  const hasUnsavedEdits = effectiveHasDirty || llmChannelHasDirty;
+  const hasPendingSave = isSaving || llmChannelIsSaving || isImportingEnv;
+  const shouldGuardDeparture = hasUnsavedEdits || hasPendingSave;
+  const clearAllDrafts = () => {
+    resetDraft();
+    setSchedulerOverrideFromUi(null);
+    setLlmChannelDraftItems([]);
+    setLlmChannelHasDirty(false);
+    setLocalDraftResetToken((current) => current + 1);
+  };
+  const resetAllDrafts = () => {
+    if (!hasPendingSave) {
+      clearAllDrafts();
+    }
+  };
   const effectiveDirtyCount = dirtyCount + (hasRuntimeSchedulerMismatchInDraft ? 1 : 0);
+
+  // Guard every draft owner, including editor-local changes that are not yet
+  // serializable as valid configuration update items.
+  useEffect(() => {
+    if (!shouldGuardDeparture) {
+      return;
+    }
+    const handler = (event: BeforeUnloadEvent) => {
+      // preventDefault is the modern cancellation signal; returnValue keeps
+      // compatibility with browsers using the legacy beforeunload contract.
+      event.preventDefault();
+      event.returnValue = t('settings.unsavedChangesMessage');
+      return event.returnValue;
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => {
+      window.removeEventListener('beforeunload', handler);
+    };
+  }, [shouldGuardDeparture, t]);
+
+  // Category changes stay within /settings; leaving through browser history
+  // or an in-app link must use the same complete dirty-state predicate.
+  const settingsBlocker = useBlocker(
+    useCallback(
+      ({ currentLocation, nextLocation }: { currentLocation: Location; nextLocation: Location }) =>
+        shouldGuardDeparture && nextLocation.pathname !== '/settings'
+        // Only block when actually leaving /settings. Reload-stay on
+        // /settings?foo=bar (search-only change on the same pathname) would
+        // otherwise prompt unnecessarily.
+        ? nextLocation.pathname !== currentLocation.pathname
+        : false,
+      [shouldGuardDeparture],
+    ),
+  );
+
 
   const handleSchedulerRuntimeStateChange = useCallback(({ runtimeEnabled, overrideEnabled }: {
     runtimeEnabled: boolean | null;
@@ -1069,70 +1041,59 @@ const SettingsPage: React.FC = () => {
     setSchedulerOverrideFromUi(overrideEnabled);
   }, []);
 
-  // UI rendering rule only: hide channel-managed and legacy provider-specific
-  // LLM keys from generic fields when channel mode is active. This does not
-  // alter save/refresh payloads or config migration/rollback behavior.
-  const LLM_CHANNEL_KEY_RE = /^LLM_[A-Z0-9_]+_(PROTOCOL|API_SURFACE|BASE_URL|API_KEY|API_KEYS|MODELS|EXTRA_HEADERS|ENABLED)$/;
-  const AI_MODEL_HIDDEN_KEYS = new Set([
-    'LLM_CHANNELS',
-    'LLM_TEMPERATURE',
-    'LITELLM_MODEL',
-    'AGENT_LITELLM_MODEL',
-    'LITELLM_FALLBACK_MODELS',
-    'AIHUBMIX_KEY',
-    'DEEPSEEK_API_KEY',
-    'DEEPSEEK_API_KEYS',
-    'GEMINI_API_KEY',
-    'GEMINI_API_KEYS',
-    'GEMINI_MODEL',
-    'GEMINI_MODEL_FALLBACK',
-    'GEMINI_TEMPERATURE',
-    'ANTHROPIC_API_KEY',
-    'ANTHROPIC_API_KEYS',
-    'ANTHROPIC_MODEL',
-    'ANTHROPIC_TEMPERATURE',
-    'ANTHROPIC_MAX_TOKENS',
-    'OPENAI_API_KEY',
-    'OPENAI_API_KEYS',
-    'OPENAI_BASE_URL',
-    'OPENAI_MODEL',
-    'OPENAI_VISION_MODEL',
-    'OPENAI_TEMPERATURE',
-    'VISION_MODEL',
-  ]);
-  const SYSTEM_HIDDEN_KEYS = new Set([
-    'ADMIN_AUTH_ENABLED',
-    ...SCHEDULER_SETTING_KEYS,
-  ]);
-  const BASE_HIDDEN_KEYS = new Set([
-    'SCREENING_ENABLED',
-  ]);
-  const AGENT_HIDDEN_KEYS = new Set(['AGENT_GENERATION_BACKEND']);
-  const activeItems =
-    activeCategory === 'base'
-      ? rawActiveItems.filter((item) => !BASE_HIDDEN_KEYS.has(item.key))
-    : activeCategory === 'ai_model'
-      ? rawActiveItems.filter((item) => {
-        if (hasConfiguredChannels && LLM_CHANNEL_KEY_RE.test(item.key)) {
-          return false;
-        }
-        if (hasConfiguredChannels && !hasLitellmConfig && AI_MODEL_HIDDEN_KEYS.has(item.key)) {
-          return false;
-        }
-        return true;
-      })
-      : activeCategory === 'system'
-        ? rawActiveItems.filter((item) => !SYSTEM_HIDDEN_KEYS.has(item.key))
-      : activeCategory === 'agent'
-        ? rawActiveItems.filter((item) => !AGENT_HIDDEN_KEYS.has(item.key))
-      : rawActiveItems;
+  const activeItems = rawActiveItems.filter(
+    (item) => !isItemHiddenInSettings(activeCategory, item, aiModelHasConfiguredChannels, aiModelHasConfiguredYaml),
+  );
   const promptCacheAdvancedItems = activeCategory === 'ai_model'
     ? activeItems.filter(isPromptCacheAdvancedSetting)
     : [];
   const visibleActiveItems = activeCategory === 'ai_model'
     ? activeItems.filter((item) => !isPromptCacheAdvancedSetting(item))
     : activeItems;
-  const hasActiveConfigItems = visibleActiveItems.length > 0 || promptCacheAdvancedItems.length > 0;
+  const effectiveVisibleItems = settingsMode === 'essential'
+    ? visibleActiveItems.filter((item) => ESSENTIAL_SETTING_KEYS.has(item.key))
+    : visibleActiveItems;
+  const effectivePromptCacheAdvancedItems = settingsMode === 'essential' ? [] : promptCacheAdvancedItems;
+  const hiddenEssentialCount = settingsMode === 'essential'
+    ? Math.max(0, activeItems.length - effectiveVisibleItems.length)
+    : 0;
+  const hasActiveConfigItems = effectiveVisibleItems.length > 0 || effectivePromptCacheAdvancedItems.length > 0;
+  const trimmedSearchQuery = searchQuery.trim().toLowerCase();
+  const searchMatches = useMemo(() => {
+    if (!trimmedSearchQuery) {
+      return [] as Array<{ category: string; categoryTitle: string; item: SystemConfigItem }>;
+    }
+    const matches: Array<{ category: string; categoryTitle: string; item: SystemConfigItem }> = [];
+    for (const category of categories) {
+      const catTitle = getCategoryTitle(category.category as SystemConfigCategory, category.title, uiLanguage);
+      const list = itemsByCategory[category.category] || [];
+      for (const item of list) {
+        if (isItemHiddenInSettings(category.category, item, aiModelHasConfiguredChannels, aiModelHasConfiguredYaml)) {
+          continue;
+        }
+        const localizationKey = item.schema?.key ?? item.key;
+        const localizedTitle = uiLanguage === 'zh'
+          ? getFieldTitleZh(localizationKey, getFieldTitleZh(item.key, item.schema?.title ?? item.key))
+          : (item.schema?.title ?? item.key);
+        const helpContent = getSettingsHelpContent(item.schema?.helpKey, item.schema?.description, uiLanguage);
+        const localizedDescription = uiLanguage === 'en'
+          ? helpContent?.summary ?? item.schema?.description ?? ''
+          : getFieldDescriptionZh(localizationKey, getFieldDescriptionZh(item.key, item.schema?.description));
+        const haystack = [
+          item.key,
+          item.schema?.title ?? '',
+          item.schema?.description ?? '',
+          localizedTitle,
+          localizedDescription,
+          catTitle,
+        ].join(' ').toLowerCase();
+        if (haystack.includes(trimmedSearchQuery)) {
+          matches.push({ category: category.category, categoryTitle: catTitle, item });
+        }
+      }
+    }
+    return matches;
+  }, [aiModelHasConfiguredChannels, aiModelHasConfiguredYaml, categories, itemsByCategory, trimmedSearchQuery, uiLanguage]);
   const isEnvBackupAllowed = isDesktopRuntime || authEnabled;
   const envBackupActionDisabled = isLoading || isSaving || isExportingEnv || isImportingEnv || !isEnvBackupAllowed;
 
@@ -1160,9 +1121,12 @@ const SettingsPage: React.FC = () => {
   };
 
   const beginEnvBackupImport = () => {
+    if (hasPendingSave) {
+      return;
+    }
     setEnvBackupActionError(null);
     setEnvBackupActionSuccess('');
-    if (hasDirty) {
+    if (hasUnsavedEdits) {
       setShowImportConfirm(true);
       return;
     }
@@ -1173,7 +1137,7 @@ const SettingsPage: React.FC = () => {
     const file = event.target.files?.[0];
     event.target.value = '';
     setShowImportConfirm(false);
-    if (!file) {
+    if (!file || hasPendingSave) {
       return;
     }
 
@@ -1187,6 +1151,9 @@ const SettingsPage: React.FC = () => {
         content,
         reloadNow: true,
       });
+      // The server accepted the replacement. Discard every local draft even
+      // if the following refresh fails or the model fingerprint is unchanged.
+      clearAllDrafts();
       const reloaded = await load();
       if (!reloaded) {
         setEnvBackupActionError(createParsedApiError({
@@ -1207,31 +1174,6 @@ const SettingsPage: React.FC = () => {
       setEnvBackupActionError(getParsedApiError(error));
     } finally {
       setIsImportingEnv(false);
-    }
-  };
-
-  const handleDesktopUpdateCheck = async () => {
-    if (!desktopRuntimeApi?.checkForUpdates) {
-      return;
-    }
-
-    setIsCheckingDesktopUpdate(true);
-    setDesktopUpdateState((current) => ({
-      ...(current || {}),
-      status: 'checking',
-      message: t('settings.desktopUpdateCheckingMessage'),
-    }));
-
-    try {
-      const state = await desktopRuntimeApi.checkForUpdates();
-      setDesktopUpdateState(normalizeDesktopUpdateState(state));
-    } catch (error: unknown) {
-      setDesktopUpdateState({
-        status: 'error',
-        message: error instanceof Error ? error.message : t('settings.desktopUpdateErrorMessage'),
-      });
-    } finally {
-      setIsCheckingDesktopUpdate(false);
     }
   };
 
@@ -1265,6 +1207,9 @@ const SettingsPage: React.FC = () => {
   };
 
   const handleSaveConfig = async () => {
+    if (isImportingEnv) {
+      return;
+    }
     const changedItems = getChangedItems();
     const syncRuntimeSchedulerState =
       schedulerOverrideFromUi !== null
@@ -1309,38 +1254,13 @@ const SettingsPage: React.FC = () => {
     }
   };
 
-  const openDesktopReleasePage = async () => {
-    if (!desktopRuntimeApi?.openReleasePage) {
-      return;
-    }
-
-    await desktopRuntimeApi.openReleasePage(desktopUpdateState?.releaseUrl);
-  };
-
-  const installDesktopUpdate = async () => {
-    if (!desktopRuntimeApi?.installDownloadedUpdate) {
-      setDesktopUpdateState((current) => ({
-        ...(current || {}),
-        status: 'error',
-        message: t('settings.desktopManualUnsupported'),
-      }));
-      return;
-    }
-
-    try {
-      setDesktopUpdateState((current) => ({
-        ...(current || {}),
-        status: 'installing',
-        message: t('settings.desktopUpdateInstallingMessage'),
-      }));
-      await desktopRuntimeApi.installDownloadedUpdate();
-    } catch (error: unknown) {
-      setDesktopUpdateState((current) => ({
-        ...(current || {}),
-        status: 'error',
-        message: error instanceof Error ? error.message : t('settings.desktopManualUnsupported'),
-      }));
-    }
+  // Setup guide renders only under the base category, so switching category changes
+  // nothing here: scroll to the SettingsField control for STOCK_LIST and focus it.
+  const handleEditSetupStockList = () => {
+    setActiveCategory('base');
+    const node = document.getElementById('setting-STOCK_LIST');
+    node?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    node?.focus({ preventScroll: true });
   };
 
   const handleRunSetupSmoke = async () => {
@@ -1391,7 +1311,6 @@ const SettingsPage: React.FC = () => {
     }
   };
 
-  const desktopUpdateNotice = getDesktopUpdateNotice(desktopUpdateState, t);
   const shouldGuardActiveConfigPanel = activeCategory === 'notification' || activeCategory === 'agent';
   const activeConfigPanelErrorTitle = activeCategory === 'agent' ? t('settings.agentSettings') : t('settings.notificationSettings');
   const settingsPanelDiagnosticHint = isDesktopRuntime
@@ -1402,33 +1321,33 @@ const SettingsPage: React.FC = () => {
   const activeCategoryTitle = getCategoryTitle(activeCategory as SystemConfigCategory, t('settings.activePanelTitle'), uiLanguage);
   const activeCategoryDescription = getCategoryDescription(activeCategory as SystemConfigCategory, '', uiLanguage);
   const selectedAgentBackend = (rawActiveItemMap.get('AGENT_BACKEND') || 'auto').trim().toLowerCase();
-  const selectedAgentArch = (rawActiveItemMap.get('AGENT_ARCH') || 'single').trim().toLowerCase();
-  const hasCodexArchitectureConflict = selectedAgentBackend === 'codex_app_server' && selectedAgentArch !== 'single';
-  const codexArchitectureIssue: ConfigValidationIssue = {
-    key: 'AGENT_ARCH',
-    code: 'unsupported_agent_arch',
-    message: t('settings.agentBackendSingleOnly'),
-    severity: 'error',
-    expected: 'single',
-    actual: selectedAgentArch,
-  };
   const activeConfigPanel = hasActiveConfigItems ? (
     <SettingsSectionCard
       title={activeCategoryTitle}
       description={activeCategoryDescription || t('settings.activePanelDescription')}
     >
-      {visibleActiveItems.length ? (
+      {settingsMode === 'essential' && hiddenEssentialCount > 0 ? (
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border/60 bg-background/40 px-3 py-2 text-xs text-muted-text">
+          <span>{t('settings.essentialBanner', { hidden: hiddenEssentialCount })}</span>
+          <button
+            type="button"
+            onClick={() => setSettingsMode('all')}
+            className="font-medium text-[hsl(var(--primary))] hover:underline"
+          >
+            {t('settings.showAllSettings')}
+          </button>
+        </div>
+      ) : null}
+      {effectiveVisibleItems.length ? (
         <div className="divide-y divide-[var(--settings-border-soft)] overflow-hidden rounded-lg border border-[var(--settings-border)] bg-[var(--settings-surface)]">
-          {visibleActiveItems.map((item) => {
-            const fieldIssues = item.key === 'AGENT_ARCH' && hasCodexArchitectureConflict
-              ? [...(issueByKey[item.key] || []), codexArchitectureIssue]
-              : issueByKey[item.key] || [];
+          {effectiveVisibleItems.map((item) => {
+            const fieldIssues = issueByKey[item.key] || [];
             return (
               <SettingsField
                 key={item.key}
                 item={item}
                 value={item.value}
-                disabled={isSaving}
+                disabled={isSaving || isImportingEnv}
                 onChange={setDraftValue}
                 issues={fieldIssues}
               />
@@ -1436,7 +1355,7 @@ const SettingsPage: React.FC = () => {
           })}
         </div>
       ) : null}
-      {promptCacheAdvancedItems.length ? (
+      {effectivePromptCacheAdvancedItems.length ? (
         <details className="group/prompt-cache overflow-hidden rounded-lg border border-[var(--settings-border)] bg-[var(--settings-surface)] transition-colors duration-200 hover:bg-[var(--settings-surface-hover)]">
           <summary className="flex cursor-pointer list-none items-start justify-between gap-3 px-4 py-4 [&::-webkit-details-marker]:hidden">
             <div className="min-w-0 space-y-1">
@@ -1450,12 +1369,12 @@ const SettingsPage: React.FC = () => {
             <ChevronDown className="mt-0.5 h-4 w-4 shrink-0 text-muted-text transition-transform group-open/prompt-cache:rotate-180" aria-hidden="true" />
           </summary>
           <div className="divide-y divide-[var(--settings-border-soft)] border-t border-[var(--settings-border-soft)]">
-            {promptCacheAdvancedItems.map((item) => (
+            {effectivePromptCacheAdvancedItems.map((item) => (
               <SettingsField
                 key={item.key}
                 item={item}
                 value={item.value}
-                disabled={isSaving}
+                disabled={isSaving || isImportingEnv}
                 onChange={setDraftValue}
                 issues={issueByKey[item.key] || []}
               />
@@ -1467,7 +1386,12 @@ const SettingsPage: React.FC = () => {
   ) : (
     <EmptyState
       title={t('settings.currentCategoryEmptyTitle')}
-      description={t('settings.currentCategoryEmptyDescription')}
+      description={settingsMode === 'essential' ? t('settings.essentialBanner', { hidden: activeItems.length }) : t('settings.currentCategoryEmptyDescription')}
+      action={settingsMode === 'essential' ? (
+        <Button type="button" variant="settings-secondary" size="sm" onClick={() => setSettingsMode('all')}>
+          {t('settings.showAllSettings')}
+        </Button>
+      ) : undefined}
       className="settings-surface-panel settings-border-strong border-none bg-transparent shadow-none"
     />
   );
@@ -1489,8 +1413,8 @@ const SettingsPage: React.FC = () => {
               variant="settings-secondary"
               size="sm"
               className="px-2.5"
-              onClick={resetDraft}
-              disabled={isLoading || isSaving}
+              onClick={resetAllDrafts}
+              disabled={isLoading || hasPendingSave}
             >
               <RefreshCw className="h-4 w-4" aria-hidden="true" />
               {t('settings.reset')}
@@ -1501,7 +1425,7 @@ const SettingsPage: React.FC = () => {
               size="sm"
               className="px-2.5"
               onClick={() => void handleSaveConfig()}
-              disabled={!effectiveHasDirty || isSaving || isLoading}
+              disabled={!effectiveHasDirty || isSaving || isLoading || isImportingEnv}
               isLoading={isSaving}
               loadingText={t('settings.saving')}
             >
@@ -1514,6 +1438,58 @@ const SettingsPage: React.FC = () => {
             </Button>
           </div>
         </div>
+
+        {!isLoading ? (
+          <div className="mt-3 flex flex-col gap-2 border-t border-[var(--settings-border-soft)] pt-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="relative flex-1 max-w-md">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-text" aria-hidden="true" />
+              <input
+                type="search"
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.target.value)}
+                placeholder={t('settings.searchPlaceholder')}
+                aria-label={t('settings.searchPlaceholder')}
+                className="w-full rounded-md border border-[var(--settings-border)] bg-[var(--settings-surface)] py-1.5 pl-8 pr-8 text-xs text-foreground placeholder:text-muted-text focus:border-[hsl(var(--primary))] focus:outline-none [&::-webkit-search-cancel-button]:appearance-none [&::-webkit-search-decoration]:appearance-none"
+              />
+              {searchQuery ? (
+                <button
+                  type="button"
+                  onClick={() => setSearchQuery('')}
+                  aria-label={t('settings.searchClear')}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted-text hover:text-foreground"
+                >
+                  <X className="h-3.5 w-3.5" aria-hidden="true" />
+                </button>
+              ) : null}
+            </div>
+            <div className="inline-flex items-center rounded-md border border-[var(--settings-border)] bg-[var(--settings-surface)] p-0.5">
+              <button
+                type="button"
+                aria-pressed={settingsMode === 'all'}
+                onClick={() => setSettingsMode('all')}
+                className={`rounded px-2.5 py-1 text-xs font-medium transition-colors ${
+                  settingsMode === 'all'
+                    ? 'bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))]'
+                    : 'text-secondary-text hover:text-foreground'
+                }`}
+              >
+                {t('settings.modeAll')}
+              </button>
+              <button
+                type="button"
+                aria-pressed={settingsMode === 'essential'}
+                onClick={() => setSettingsMode('essential')}
+                className={`rounded px-2.5 py-1 text-xs font-medium transition-colors ${
+                  settingsMode === 'essential'
+                    ? 'bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))]'
+                    : 'text-secondary-text hover:text-foreground'
+                }`}
+              >
+                {t('settings.modeEssential')}
+              </button>
+            </div>
+          </div>
+        ) : null}
 
         {saveError ? (
           <ApiErrorAlert
@@ -1548,7 +1524,59 @@ const SettingsPage: React.FC = () => {
           </aside>
 
           <section className="space-y-4">
-            {shouldShowFirstRunSetup ? (
+            {trimmedSearchQuery ? (
+              <SettingsSectionCard
+                title={t('settings.searchResultsTitle', { count: searchMatches.length })}
+                actions={(
+                  <Button type="button" variant="settings-secondary" size="sm" onClick={() => setSearchQuery('')}>
+                    {t('settings.searchClear')}
+                  </Button>
+                )}
+              >
+                {searchMatches.length ? (
+                  <div className="space-y-3">
+                    {searchMatches.map(({ category, categoryTitle, item }) => (
+                      <div
+                        key={`${category}:${item.key}`}
+                        className="overflow-hidden rounded-lg border border-[var(--settings-border)] bg-[var(--settings-surface)]"
+                      >
+                        <div className="flex items-center justify-between border-b border-[var(--settings-border-soft)] bg-background/40 px-3 py-1.5 text-[11px] text-muted-text">
+                          <span>{categoryTitle}</span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setActiveCategory(category);
+                              setSearchQuery('');
+                            }}
+                            className="font-medium text-[hsl(var(--primary))] hover:underline"
+                          >
+                            {t('settings.jumpToCategory')}
+                          </button>
+                        </div>
+                        <SettingsField
+                          item={item}
+                          value={item.value}
+                          disabled={isSaving || isImportingEnv}
+                          onChange={setDraftValue}
+                          issues={issueByKey[item.key] || []}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <EmptyState
+                    title={t('settings.searchNoResults')}
+                    action={(
+                      <Button type="button" variant="settings-secondary" size="sm" onClick={() => setSearchQuery('')}>
+                        {t('settings.searchClear')}
+                      </Button>
+                    )}
+                    className="settings-surface-panel settings-border-strong border-none bg-transparent shadow-none"
+                  />
+                )}
+              </SettingsSectionCard>
+            ) : null}
+            {!trimmedSearchQuery && shouldShowFirstRunSetup ? (
               <FirstRunSetupCard
                 status={setupStatus}
                 isLoading={isRefreshingSetupStatus}
@@ -1560,12 +1588,13 @@ const SettingsPage: React.FC = () => {
                 smokeSuccess={setupSmokeSuccess}
                 onRefresh={refreshSetupStatus}
                 onSelectCategory={setActiveCategory}
+                onEditStockList={handleEditSetupStockList}
                 onRunSmoke={handleRunSetupSmoke}
                 listSeparator={uiLanguage === 'en' ? ', ' : '、'}
                 t={t}
               />
             ) : null}
-            {shouldShowScreeningSettings ? (
+            {!trimmedSearchQuery && shouldShowScreeningSettings ? (
               <SettingsSectionCard
                 title={t('settings.screening')}
                 description={t('settings.screeningDescription')}
@@ -1587,7 +1616,7 @@ const SettingsPage: React.FC = () => {
                       type="button"
                       variant={screeningEnabled ? 'settings-secondary' : 'settings-primary'}
                       onClick={() => void updateScreeningEnabled(!screeningEnabled)}
-                      disabled={isSaving || isLoading || isUpdatingScreening}
+                      disabled={isSaving || isLoading || isImportingEnv || isUpdatingScreening}
                       isLoading={isUpdatingScreening}
                       loadingText={screeningEnabled ? t('settings.disablingScreening') : t('settings.enablingScreening')}
                     >
@@ -1607,11 +1636,13 @@ const SettingsPage: React.FC = () => {
                 ) : null}
               </SettingsSectionCard>
             ) : null}
-            {activeCategory === 'system' ? <AuthSettingsCard /> : null}
-            {activeCategory === 'system' ? (
+            {!trimmedSearchQuery && activeCategory === 'system' ? <AuthSettingsCard /> : null}
+            {activeCategory === 'system' || schedulerOverrideFromUi !== null ? (
+              <div hidden={Boolean(trimmedSearchQuery) || activeCategory !== 'system'}>
               <SchedulerSettingsCard
-                items={rawActiveItems}
-                disabled={isSaving || isLoading}
+                draftResetToken={localDraftResetToken}
+                items={itemsByCategory.system || []}
+                disabled={isSaving || isLoading || isImportingEnv}
                 issueByKey={issueByKey}
                 statusRefreshToken={schedulerStatusRefreshToken}
                 onSchedulerStateChange={handleSchedulerRuntimeStateChange}
@@ -1619,8 +1650,10 @@ const SettingsPage: React.FC = () => {
                 t={t}
                 language={uiLanguage}
               />
+              </div>
             ) : null}
-            {activeCategory === 'system' ? (
+            {!trimmedSearchQuery && activeCategory === 'system' ? (
+              <div id="desktop-version-info">
               <SettingsSectionCard
                 title={t('settings.versionInfo')}
                 description={t('settings.versionInfoDescription')}
@@ -1679,7 +1712,7 @@ const SettingsPage: React.FC = () => {
                         type="button"
                         variant="settings-secondary"
                         onClick={() => void handleDesktopUpdateCheck()}
-                        disabled={isCheckingDesktopUpdate}
+                        disabled={isDesktopUpdateBusy}
                         isLoading={isCheckingDesktopUpdate}
                         loadingText={t('settings.checkingDesktopUpdate')}
                       >
@@ -1713,8 +1746,9 @@ const SettingsPage: React.FC = () => {
                   </p>
                 ) : null}
               </SettingsSectionCard>
+              </div>
             ) : null}
-            {activeCategory === 'system' ? (
+            {!trimmedSearchQuery && activeCategory === 'system' ? (
               <SettingsSectionCard
                 title={t('settings.configBackup')}
                 description={t('settings.configBackupDescription')}
@@ -1740,7 +1774,7 @@ const SettingsPage: React.FC = () => {
                       type="button"
                       variant="settings-primary"
                       onClick={beginEnvBackupImport}
-                      disabled={envBackupActionDisabled}
+                      disabled={envBackupActionDisabled || hasPendingSave}
                       isLoading={isImportingEnv}
                       loadingText={t('settings.importingEnv')}
                     >
@@ -1775,7 +1809,7 @@ const SettingsPage: React.FC = () => {
                 </div>
               </SettingsSectionCard>
             ) : null}
-            {activeCategory === 'base' ? (
+            {!trimmedSearchQuery && activeCategory === 'base' ? (
               <SettingsSectionCard
                 title={t('settings.intelligentImport')}
                 description={t('settings.intelligentImportDescription')}
@@ -1790,11 +1824,12 @@ const SettingsPage: React.FC = () => {
                     await refreshAfterExternalSave(['STOCK_LIST']);
                     void refreshSetupStatus();
                   }}
-                  disabled={isSaving || isLoading}
+                  disabled={isSaving || isLoading || isImportingEnv}
                 />
               </SettingsSectionCard>
             ) : null}
-            {activeCategory === 'ai_model' ? (
+            {activeCategory === 'ai_model' || llmChannelHasDirty || llmChannelIsSaving ? (
+              <div hidden={Boolean(trimmedSearchQuery) || activeCategory !== 'ai_model'}>
               <SettingsSectionCard
                 title={t('settings.llmAccess')}
                 description={t('settings.llmAccessDescription')}
@@ -1802,27 +1837,32 @@ const SettingsPage: React.FC = () => {
                 <GenerationBackendStatusPanel
                   items={generationBackendDraftItems}
                   maskToken={maskToken}
-                  disabled={isSaving || isLoading}
+                  disabled={isSaving || isLoading || isImportingEnv}
                 />
                 <LLMChannelEditor
-                  items={rawActiveItems}
+                  draftResetToken={localDraftResetToken}
+                  onDirtyChange={setLlmChannelHasDirty}
+                  onSavingChange={setLlmChannelIsSaving}
+                  items={itemsByCategory.ai_model || []}
                   configVersion={configVersion}
                   maskToken={maskToken}
                   modelProviderPrefixes={llmModelProviders}
+                  llmYamlActive={llmYamlActive}
                   onDraftItemsChange={handleLlmChannelDraftItemsChange}
                   onSaved={async (updatedItems) => {
                     setLlmChannelDraftItems([]);
                     await refreshAfterExternalSave(updatedItems.map((item) => item.key));
                     void refreshSetupStatus();
                   }}
-                  disabled={isSaving || isLoading}
+                  disabled={isSaving || isLoading || isImportingEnv}
                 />
               </SettingsSectionCard>
+              </div>
             ) : null}
-            {activeCategory === 'system' && passwordChangeable ? (
+            {!trimmedSearchQuery && activeCategory === 'system' && passwordChangeable ? (
               <ChangePasswordCard />
             ) : null}
-            {activeCategory === 'notification' ? (
+            {!trimmedSearchQuery && activeCategory === 'notification' ? (
               <SettingsPanelErrorBoundary
                 title={t('settings.notificationTest')}
                 resetKey={`notification-test:${configVersion}`}
@@ -1831,11 +1871,11 @@ const SettingsPage: React.FC = () => {
                 <NotificationTestPanel
                   items={rawActiveItems.map((item) => ({ key: item.key, value: String(item.value ?? '') }))}
                   maskToken={maskToken}
-                  disabled={isSaving || isLoading}
+                  disabled={isSaving || isLoading || isImportingEnv}
                 />
               </SettingsPanelErrorBoundary>
             ) : null}
-            {activeCategory === 'agent' ? (
+            {!trimmedSearchQuery && activeCategory === 'agent' ? (
               <SettingsPanelErrorBoundary
                 title={t('settings.agentBackendStatus')}
                 resetKey={`agent-backend:${configVersion}`}
@@ -1849,23 +1889,23 @@ const SettingsPage: React.FC = () => {
                     items={agentBackendDraftItems}
                     maskToken={maskToken}
                     selectedBackend={selectedAgentBackend}
-                    agentArch={selectedAgentArch}
-                    disabled={isSaving || isLoading}
-                    onUseSingleAgent={() => setDraftValue('AGENT_ARCH', 'single')}
+                    disabled={isSaving || isLoading || isImportingEnv}
                     onEnableAgentMode={() => setDraftValue('AGENT_MODE', 'true')}
                   />
                 </SettingsSectionCard>
               </SettingsPanelErrorBoundary>
             ) : null}
-            {shouldGuardActiveConfigPanel && hasActiveConfigItems ? (
-              <SettingsPanelErrorBoundary
-                title={activeConfigPanelErrorTitle}
-                resetKey={`${activeCategory}:${configVersion}`}
-                diagnosticHint={settingsPanelDiagnosticHint}
-              >
-                {activeConfigPanel}
-              </SettingsPanelErrorBoundary>
-            ) : activeConfigPanel}
+            {!trimmedSearchQuery ? (
+              shouldGuardActiveConfigPanel && hasActiveConfigItems ? (
+                <SettingsPanelErrorBoundary
+                  title={activeConfigPanelErrorTitle}
+                  resetKey={`${activeCategory}:${configVersion}`}
+                  diagnosticHint={settingsPanelDiagnosticHint}
+                >
+                  {activeConfigPanel}
+                </SettingsPanelErrorBoundary>
+              ) : activeConfigPanel
+            ) : null}
           </section>
         </div>
       )}
@@ -1890,12 +1930,34 @@ const SettingsPage: React.FC = () => {
         message={t('settings.importConfirmMessage')}
         confirmText={t('settings.importConfirmContinue')}
         cancelText={t('common.cancel')}
+        confirmDisabled={hasPendingSave}
         onConfirm={() => {
+          if (hasPendingSave) {
+            return;
+          }
           setShowImportConfirm(false);
           envBackupImportRef.current?.click();
         }}
         onCancel={() => {
           setShowImportConfirm(false);
+        }}
+      />
+      <ConfirmDialog
+        isOpen={settingsBlocker.state === 'blocked'}
+        title={t(hasPendingSave ? 'settings.saving' : hasUnsavedEdits ? 'settings.unsavedChangesTitle' : 'settings.actionSuccess')}
+        message={t(hasPendingSave ? 'settings.pendingSaveLeaveMessage' : hasUnsavedEdits ? 'settings.unsavedChangesMessage' : 'settings.savedChangesLeaveMessage')}
+        confirmText={t(hasPendingSave ? 'settings.saving' : hasUnsavedEdits ? 'settings.unsavedChangesDiscard' : 'common.confirm')}
+        cancelText={t('common.cancel')}
+        confirmDisabled={hasPendingSave}
+        onConfirm={() => {
+          if (hasPendingSave) {
+            return;
+          }
+          resetAllDrafts();
+          settingsBlocker.proceed?.();
+        }}
+        onCancel={() => {
+          settingsBlocker.reset?.();
         }}
       />
     </div>

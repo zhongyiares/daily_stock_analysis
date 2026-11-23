@@ -1,4 +1,7 @@
 # -*- coding: utf-8 -*-
+import copy
+import json
+import math
 import os
 import sys
 from types import SimpleNamespace
@@ -155,6 +158,75 @@ def test_convert_messages_matches_slashless_openai_target_without_provider_leaka
     assert matching[0]["reasoning_content"] == "provider-only"
     assert matching[0]["tool_calls"][0]["provider_specific_fields"] == {"thought_signature": "sig-1"}
     assert mismatched == []
+
+
+def _reject_nonfinite_json_constant(token: str) -> float:
+    """Strict JSON parser hook: RFC 8259 has no NaN/Infinity constants."""
+    raise ValueError(f"non-standard JSON constant: {token}")
+
+
+def test_convert_messages_sanitizes_nan_and_infinity_in_tool_content() -> None:
+    adapter = LLMToolAdapter.__new__(LLMToolAdapter)
+    content = {
+        "price": float("nan"),
+        "volume": float("inf"),
+        "spread": float("-inf"),
+        "history": [1.5, float("nan"), {"deep": float("inf")}],
+        "label": "NaN",
+        "count": 3,
+    }
+    original = copy.deepcopy(content)
+    messages = [
+        {"role": "tool", "tool_call_id": "call_1", "content": content},
+    ]
+
+    converted = adapter._convert_messages(messages)
+    raw = converted[0]["content"]
+
+    # Must be strict RFC 8259 JSON: no bare NaN/Infinity tokens survive.
+    parsed = json.loads(raw, parse_constant=_reject_nonfinite_json_constant)
+    assert parsed["price"] is None
+    assert parsed["volume"] is None
+    assert parsed["spread"] is None
+    assert parsed["history"] == [1.5, None, {"deep": None}]
+    # Finite values and literal strings pass through unchanged.
+    assert parsed["label"] == "NaN"
+    assert parsed["count"] == 3
+    # Original message content must not be mutated.
+    assert content == original
+    assert math.isnan(content["price"])
+
+
+def test_convert_messages_sanitizes_nan_and_infinity_in_tool_call_arguments() -> None:
+    adapter = LLMToolAdapter.__new__(LLMToolAdapter)
+    arguments = {
+        "threshold": float("nan"),
+        "gains": {"day": float("inf"), "week": float("-inf")},
+        "series": [float("nan"), 2.25],
+        "name": "Infinity",
+    }
+    original = copy.deepcopy(arguments)
+    messages = [
+        {
+            "role": "assistant",
+            "content": "checking",
+            "tool_calls": [
+                {"id": "call_1", "name": "echo", "arguments": arguments},
+            ],
+        },
+    ]
+
+    converted = adapter._convert_messages(messages)
+    raw = converted[0]["tool_calls"][0]["function"]["arguments"]
+
+    parsed = json.loads(raw, parse_constant=_reject_nonfinite_json_constant)
+    assert parsed["threshold"] is None
+    assert parsed["gains"] == {"day": None, "week": None}
+    assert parsed["series"] == [None, 2.25]
+    assert parsed["name"] == "Infinity"
+    # Original tool-call arguments must not be mutated.
+    assert arguments == original
+    assert math.isnan(arguments["threshold"])
 
 
 def test_parse_litellm_response_extracts_claude_blocks_and_tool_provider_fields() -> None:
@@ -496,3 +568,72 @@ def test_parse_litellm_response_hmac_covers_tool_call_wire_messages(monkeypatch)
     assert first.usage["messages_hmac"]
     assert second.usage["messages_hmac"]
     assert first.usage["messages_hmac"] != second.usage["messages_hmac"]
+
+
+def test_thinking_extra_body_caps_minimax_reasoning_effort() -> None:
+    from src.agent.llm_adapter import (
+        apply_thinking_extra_body_to_model_list,
+        get_thinking_extra_body,
+        merge_thinking_extra_body,
+    )
+
+    assert get_thinking_extra_body("MiniMax-M3.1-Flash") == {"reasoning_effort": "low"}
+    assert get_thinking_extra_body("minimax-m3.1-flash") == {"reasoning_effort": "low"}
+    assert get_thinking_extra_body("MiniMax-M3") is None
+    assert get_thinking_extra_body("deepseek-reasoner") is None
+    assert get_thinking_extra_body("deepseek-chat") == {"thinking": {"type": "enabled"}}
+
+    # Preserves YAML deployment extra_body (e.g. OpenRouter provider routing & privacy)
+    # without mutating caller data, and honors explicit user overrides.
+    original_model_list = [
+        {
+            "model_name": "fast-minimax",
+            "litellm_params": {
+                "model": "openai/minimax/minimax-m3.1-flash",
+                "api_base": "https://openrouter.ai/api/v1",
+                "extra_body": {
+                    "provider": {
+                        "only": ["minimax"],
+                        "allow_fallbacks": False,
+                        "data_collection": "deny",
+                    }
+                },
+            },
+        },
+        {
+            "model_name": "explicit-extra-body",
+            "litellm_params": {
+                "model": "openai/minimax/minimax-m3.1-flash",
+                "extra_body": {
+                    "provider": {"only": ["minimax"]},
+                    "reasoning_effort": "high",
+                },
+            },
+        },
+        {
+            "model_name": "explicit-top-level",
+            "litellm_params": {
+                "model": "openai/minimax/minimax-m3.1-flash",
+                "reasoning_effort": "medium",
+                "extra_body": {"provider": {"only": ["minimax"]}},
+            },
+        },
+    ]
+    prepared = apply_thinking_extra_body_to_model_list(original_model_list)
+    assert "reasoning_effort" not in original_model_list[0]["litellm_params"]["extra_body"]
+    assert prepared[0]["litellm_params"]["extra_body"] == {
+        "provider": {
+            "only": ["minimax"],
+            "allow_fallbacks": False,
+            "data_collection": "deny",
+        },
+        "reasoning_effort": "low",
+    }
+    assert prepared[1]["litellm_params"]["extra_body"] == {
+        "provider": {"only": ["minimax"]},
+        "reasoning_effort": "high",
+    }
+    assert prepared[2]["litellm_params"]["extra_body"] == {
+        "provider": {"only": ["minimax"]},
+    }
+    assert merge_thinking_extra_body({"reasoning_effort": "medium"}, {"reasoning_effort": "low"}) is None

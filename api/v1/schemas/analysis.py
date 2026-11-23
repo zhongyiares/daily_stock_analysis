@@ -115,7 +115,11 @@ class MarketReviewRequest(BaseModel):
 
     send_notification: bool = Field(
         True,
-        description="是否在大盘复盘完成后发送推送通知",
+        validation_alias=AliasChoices("send_notification", "notify"),
+        description=(
+            "是否在大盘复盘完成后发送推送通知；"
+            "也接受 notify 作为请求体别名（与个股 analyze 字段名对齐）"
+        ),
     )
     report_language: Optional[Literal["zh", "en", "ko"]] = Field(
         None,
@@ -127,14 +131,14 @@ class MarketReviewRequest(BaseModel):
         min_length=1,
         max_length=64,
         description=(
-            "本次大盘复盘市场覆盖。合法 token 为 cn、hk、us、jp、kr、both；"
+            "本次大盘复盘市场覆盖。合法 token 为 cn、hk、us、jp、kr、tw、both；"
             "both 只能单独使用，其余 token 可用逗号组合。输入会忽略大小写和 token 两侧空格、"
-            "去重并按 cn,hk,us,jp,kr 排序；空值、空 token、未知 token、both 混用或超过 "
+            "去重并按 cn,hk,us,jp,kr,tw 排序；空值、空 token、未知 token、both 混用或超过 "
             "64 个字符会整体返回 4xx，不会部分执行。未传时使用运行时全局 MARKET_REVIEW_REGION。"
         ),
         json_schema_extra={
             "example": "cn,us",
-            "examples": ["cn", "jp,kr", "both"],
+            "examples": ["cn", "tw", "cn,tw", "both"],
         },
     )
 
@@ -231,6 +235,10 @@ class BatchTaskAcceptedItem(BaseModel):
     )
     message: Optional[str] = Field(None, description="提示信息")
     analysis_phase: AnalysisPhase = Field("auto", description="请求的分析阶段")
+    asset_type: Optional[Literal["stock", "index"]] = Field(
+        None,
+        description="parser 来源的可选资产类型（stock/index）；由已提交的 analysis_target 透传，旧客户端可缺省",
+    )
 
     model_config = ConfigDict(json_schema_extra={
         "example": {
@@ -259,11 +267,29 @@ class BatchDuplicateTaskItem(BaseModel):
     })
 
 
+class RejectedTaskItem(BaseModel):
+    """批量异步任务中被明确拒绝的单个目标项（如未登记 CSI 指数）。"""
+
+    stock_code: str = Field(..., description="被拒绝的目标代码")
+    message: str = Field(..., description="拒绝原因")
+
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "stock_code": "930956.CSI",
+            "message": "unregistered CSI index: '930956.CSI' is not in the index registry",
+        }
+    })
+
+
 class BatchTaskAcceptedResponse(BaseModel):
     """批量异步任务接受响应。"""
 
     accepted: List[BatchTaskAcceptedItem] = Field(default_factory=list, description="成功提交的任务列表")
     duplicates: List[BatchDuplicateTaskItem] = Field(default_factory=list, description="重复而跳过的任务列表")
+    rejected: Optional[List[RejectedTaskItem]] = Field(
+        None,
+        description="批量中被明确拒绝的目标列表（如未登记 CSI 指数），仅在异步批量请求中返回",
+    )
     message: str = Field(..., description="汇总信息")
 
     model_config = ConfigDict(json_schema_extra={
@@ -384,6 +410,10 @@ class TaskInfo(BaseModel):
     region: Optional[str] = Field(
         None,
         description="大盘复盘任务实际执行的 canonical 市场范围",
+    )
+    asset_type: Optional[Literal["stock", "index"]] = Field(
+        None,
+        description="parser 来源的可选资产类型（stock/index）；由已提交的 analysis_target 透传，旧客户端可缺省",
     )
     
     model_config = ConfigDict(json_schema_extra={

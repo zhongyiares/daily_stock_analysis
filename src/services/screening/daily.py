@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -18,6 +18,13 @@ from typing import Callable
 import pandas as pd
 import requests
 
+from data_provider.tushare_fetcher import (
+    TUSHARE_PERMISSION_COOLDOWN_SECONDS,
+    _build_tushare_token_scope,
+    is_tushare_permission_error,
+)
+from src.utils.rsi import wilder_rsi
+from src.core.trading_calendar import MarketPhase, build_market_phase_context, get_market_for_stock, is_market_open
 from src.services.screening.source_guard import call_with_timeout, parse_source_timeout_seconds
 
 _DAILY_FEATURE_DEFAULTS = {
@@ -109,6 +116,9 @@ def enrich_daily_features(
                 cache_dir=cache_dir,
                 cache_ttl_seconds=cache_ttl_seconds,
             )
+            if daily_history_is_stale(hist, code=code):
+                hist = hist.copy()
+                hist.attrs["daily_stale"] = True
             features = compute_daily_features(hist)
             features["daily_source"] = str(hist.attrs.get("daily_source", ""))
             metadata = {
@@ -180,7 +190,8 @@ def fetch_daily_history(
     free sources. Without a token it starts with Tencent. Sina is a second
     direct HTTP K-line source before wrapper-based fallbacks. ``yfinance`` is
     explicit-only (never part of ``auto``) and expects a US ticker rather than
-    an A-share code.
+    an A-share code. Lagging bars do not stop the auto fallback chain; they are
+    retained for degraded use only if no source provides fresh history.
     """
     normalized_code = _normalize_daily_code(code)
     normalized_lookback_days = int(lookback_days)
@@ -212,12 +223,12 @@ def fetch_daily_history(
 
     attempts = max(int(retries), 0) + 1
     errors: list[str] = []
+    stale_history: pd.DataFrame | None = None
     for current in sources:
         disabled_reason = _source_disabled_reason(current)
         if disabled_reason:
             errors.append(f"{current}: {disabled_reason}")
             continue
-        last_error: Exception | None = None
         for attempt in range(attempts):
             try:
                 if current == "yfinance":
@@ -263,6 +274,9 @@ def fetch_daily_history(
                         normalized_code,
                         lookback_days=normalized_lookback_days,
                     )
+                is_stale = daily_history_is_stale(result, code=normalized_code)
+                if is_stale and pd.isna(_latest_daily_bar_date(result, code=normalized_code)):
+                    raise ValueError("invalid daily session")
                 _record_source_success(current, rows=len(result))
                 result.attrs["daily_source"] = current
                 result.attrs["daily_requested_source"] = src
@@ -270,6 +284,16 @@ def fetch_daily_history(
                 result.attrs["daily_source_order_notes"] = list(source_order_notes)
                 result.attrs["source_errors"] = list(errors)
                 result.attrs["daily_source_health"] = _daily_source_health_snapshot(sources)
+                if is_stale:
+                    result.attrs["daily_stale"] = True
+                    if (
+                        stale_history is None
+                        or pd.isna(_latest_daily_bar_date(stale_history, code=normalized_code))
+                        or _latest_daily_bar_date(result, code=normalized_code) > _latest_daily_bar_date(stale_history, code=normalized_code)
+                    ):
+                        stale_history = result
+                    source_order_notes.append(f"{current}: stale daily history")
+                    break
                 if cache_path is not None:
                     _write_daily_history_cache(
                         cache_path,
@@ -280,30 +304,48 @@ def fetch_daily_history(
                     )
                 return result
             except Exception as exc:  # noqa: BLE001 - aggregated below
-                last_error = exc
-                if attempt >= attempts - 1:
+                non_retryable_permission = (
+                    current == "tushare" and is_tushare_permission_error(exc)
+                )
+                if attempt >= attempts - 1 or non_retryable_permission:
+                    used_attempts = attempt + 1
+                    errors.append(f"{current} after {used_attempts} attempts: {exc}")
+                    _record_source_failure(current, exc)
                     break
                 time.sleep(min(0.5 * (attempt + 1), 2.0))
-        errors.append(f"{current} after {attempts} attempts: {last_error}")
-        _record_source_failure(current, last_error)
 
     if cache_path is not None:
-        stale = _read_daily_history_cache(
+        stale_cached = _read_daily_history_cache(
             cache_path,
             ttl_seconds=cache_ttl_seconds,
             allow_stale=True,
         )
-        if stale is not None:
-            stale.attrs["daily_stale"] = True
-            stale.attrs["daily_source_order"] = list(sources)
-            stale.attrs["daily_source_order_notes"] = list(source_order_notes)
-            stale.attrs["source_errors"] = list(errors)
-            stale.attrs["daily_source_health"] = _daily_source_health_snapshot(sources)
-            return stale
+        if stale_cached is not None and not pd.isna(_latest_daily_bar_date(stale_cached, code=normalized_code)) and (
+            stale_history is None
+            or pd.isna(_latest_daily_bar_date(stale_history, code=normalized_code))
+            or _latest_daily_bar_date(stale_cached, code=normalized_code) > _latest_daily_bar_date(stale_history, code=normalized_code)
+        ):
+            stale_history = stale_cached
+    if stale_history is not None:
+        stale_history.attrs["daily_stale"] = True
+        stale_history.attrs["daily_source_order"] = list(sources)
+        stale_history.attrs["daily_source_order_notes"] = list(source_order_notes)
+        stale_history.attrs["source_errors"] = list(errors)
+        stale_history.attrs["daily_source_health"] = _daily_source_health_snapshot(sources)
+        return stale_history
 
-    raise RuntimeError(
+    error = RuntimeError(
         f"daily history fetch failed for {normalized_code}: {'; '.join(errors)}"
     )
+    # Keep the existing exception type/message, but carry the same structured
+    # diagnostics as a degraded frame so the DSA bridge scores each failure.
+    error.daily_metadata = {
+        "source_errors": list(errors),
+        "daily_source_order": list(sources),
+        "daily_source_order_notes": list(source_order_notes),
+        "daily_source_health": _daily_source_health_snapshot(sources),
+    }
+    raise error
 
 
 def _normalize_daily_code(value: object) -> str:
@@ -345,10 +387,32 @@ def _daily_call_timeout_seconds() -> float | None:
     )
 
 
+def _current_tushare_scope() -> tuple[str, str] | None:
+    http_url = (
+        os.getenv("TUSHARE_API_URL", "").strip()
+        or os.getenv("TUSHARE_HTTP_URL", "").strip()
+        or _DEFAULT_TUSHARE_HTTP_URL
+    )
+    return _build_tushare_token_scope(_tushare_token(), http_url)
+
+
+def _refresh_permission_cooldown_locked(source: str, state: dict[str, object]) -> None:
+    if source == "tushare" and state.get("disabled_by_permission"):
+        if state.get("disabled_token_scope") != _current_tushare_scope():
+            state["failures"] = 0.0
+            state["disabled_until"] = 0.0
+            state["disabled_by_permission"] = False
+            state["disabled_token_scope"] = None
+
+
 def _rank_daily_sources_by_health(sources: tuple[str, ...]) -> tuple[tuple[str, ...], list[str]]:
     """Move unhealthy daily sources later while preserving default order ties."""
     now = time.monotonic()
     with _SOURCE_HEALTH_LOCK:
+        for source in sources:
+            live = _SOURCE_HEALTH.get(source)
+            if live is not None:
+                _refresh_permission_cooldown_locked(source, live)
         health = {source: dict(_SOURCE_HEALTH.get(source, {})) for source in sources}
     default_rank = {source: idx for idx, source in enumerate(sources)}
 
@@ -371,11 +435,16 @@ def _source_disabled_reason(source: str) -> str | None:
         state = _SOURCE_HEALTH.get(source)
         if not state:
             return None
+        _refresh_permission_cooldown_locked(source, state)
         disabled_until = float(state.get("disabled_until", 0.0))
         if disabled_until <= now:
             if disabled_until:
                 state["disabled_until"] = 0.0
+                state["disabled_by_permission"] = False
+                state["disabled_token_scope"] = None
             return None
+        if state.get("disabled_by_permission"):
+            return f"temporarily disabled for {disabled_until - now:.1f}s due to insufficient Tushare permission/points"
         return f"temporarily disabled for {disabled_until - now:.1f}s after repeated failures"
 
 
@@ -386,6 +455,8 @@ def _record_source_success(source: str, *, rows: int | None = None) -> None:
         state["successes"] = successes
         state["failures"] = 0.0
         state["disabled_until"] = 0.0
+        state["disabled_by_permission"] = False
+        state["disabled_token_scope"] = None
         state["last_success_at"] = time.time()
         if rows is not None:
             state["last_rows"] = float(rows)
@@ -395,6 +466,11 @@ def _record_source_success(source: str, *, rows: int | None = None) -> None:
 
 def _record_source_failure(source: str, error: object | None = None) -> None:
     now = time.monotonic()
+    permission_denied = (
+        source == "tushare"
+        and isinstance(error, BaseException)
+        and is_tushare_permission_error(error)
+    )
     with _SOURCE_HEALTH_LOCK:
         state = _SOURCE_HEALTH.setdefault(source, {"failures": 0.0, "disabled_until": 0.0})
         failures = float(state.get("failures", 0.0)) + 1.0
@@ -403,8 +479,14 @@ def _record_source_failure(source: str, error: object | None = None) -> None:
         state["last_failure_at"] = time.time()
         if error is not None:
             state["last_error"] = " ".join(str(error).split())
-        if failures >= _SOURCE_HEALTH_FAILURE_THRESHOLD:
+        if permission_denied:
+            state["disabled_until"] = now + float(TUSHARE_PERMISSION_COOLDOWN_SECONDS)
+            state["disabled_by_permission"] = True
+            state["disabled_token_scope"] = _current_tushare_scope()
+        elif failures >= _SOURCE_HEALTH_FAILURE_THRESHOLD:
             state["disabled_until"] = now + _SOURCE_HEALTH_COOLDOWN_SECONDS
+            state["disabled_by_permission"] = False
+            state["disabled_token_scope"] = None
 
 
 def daily_source_health_snapshot() -> dict[str, dict[str, float | bool | str]]:
@@ -417,7 +499,10 @@ def _daily_source_health_snapshot(sources: tuple[str, ...]) -> dict[str, dict[st
     snapshot: dict[str, dict[str, float | bool | str]] = {}
     with _SOURCE_HEALTH_LOCK:
         for source in sources:
-            state = dict(_SOURCE_HEALTH.get(source, {}))
+            live_state = _SOURCE_HEALTH.get(source)
+            if live_state is not None:
+                _refresh_permission_cooldown_locked(source, live_state)
+            state = dict(live_state or {})
             disabled_until = float(state.get("disabled_until", 0.0))
             cooldown_remaining = max(disabled_until - now, 0.0)
             snapshot[source] = {
@@ -449,6 +534,75 @@ def _daily_history_cache_path(
     return Path(cache_dir) / f"{safe_code}_{safe_source}_{int(lookback_days)}_{digest}.json"
 
 
+def _latest_daily_bar_date(hist: pd.DataFrame, *, code: str | None = None) -> pd.Timestamp:
+    """Return the latest usable close date, validating all sessions when given a code."""
+    if code is not None and hist.attrs.get("daily_invalid_session"):
+        return pd.NaT
+    date_column = next((column for column in ("date", "日期", "trade_date") if column in hist.columns), None)
+    if date_column is None:
+        return pd.NaT
+    dates = pd.to_datetime(hist[date_column].astype(str).str[:10], format="mixed", errors="coerce")
+    close_column = next((column for column in ("close", "收盘") if column in hist.columns), None)
+    if close_column is not None:
+        dates = dates[pd.to_numeric(hist[close_column], errors="coerce").notna()]
+    latest = dates.max()
+    if code is not None and not pd.isna(latest):
+        market = get_market_for_stock(code)
+        current = build_market_phase_context(market=market)
+        if current.phase != MarketPhase.UNKNOWN:
+            # Unparseable dates with usable prices also reach factor calculation.
+            if dates.isna().any():
+                return pd.NaT
+            if latest.date() > current.session_date:
+                return pd.NaT
+            if current.phase == MarketPhase.PREMARKET and latest.date() > current.effective_daily_bar_date:
+                return pd.NaT
+            # A valid latest bar cannot make an earlier holiday/weekend close
+            # usable: factors consume the entire frame, including those rows.
+            for bar_date in dates.dropna().unique():
+                if not is_market_open(market, pd.Timestamp(bar_date).date()):
+                    return pd.NaT
+    return latest
+
+
+def daily_history_is_stale(
+    hist: pd.DataFrame,
+    *,
+    code: str,
+    fetched_at: datetime | None = None,
+) -> bool:
+    """Check bar coverage and whether a cached partial bar predates a close.
+
+    Calendar failures retain the existing TTL-only behavior. Intraday bars are
+    allowed, but cannot be reused as completed bars after the session closes.
+    """
+    if bool(hist.attrs.get("daily_stale")):
+        return True
+    market = get_market_for_stock(code)
+    current = build_market_phase_context(market=market)
+    if current.phase == MarketPhase.UNKNOWN:
+        return False
+
+    # Daily dates may be compact YYYYMMDD integers or ISO timestamps. Keep the
+    # provider's session date instead of converting date-only bars through UTC.
+    # Validate actual sessions even intraday: the range between the last close
+    # and today's session can contain weekends or holidays after reopening.
+    latest = _latest_daily_bar_date(hist, code=code)
+    if pd.isna(latest):
+        return True
+    if current.phase in (MarketPhase.NON_TRADING, MarketPhase.PREMARKET) and latest.date() != current.effective_daily_bar_date:
+        return True
+    if not current.effective_daily_bar_date <= latest.date() <= current.session_date:
+        return True
+    if fetched_at is not None:
+        acquired = build_market_phase_context(market=market, current_time=fetched_at)
+        if acquired.phase != MarketPhase.UNKNOWN:
+            if acquired.phase in (MarketPhase.NON_TRADING, MarketPhase.PREMARKET) and latest.date() != acquired.effective_daily_bar_date:
+                return True
+            return acquired.effective_daily_bar_date < current.effective_daily_bar_date
+    return False
+
+
 def _read_daily_history_cache(
     path: Path,
     *,
@@ -461,14 +615,20 @@ def _read_daily_history_cache(
         return None
 
     ttl = _DAILY_HISTORY_CACHE_TTL_SECONDS if ttl_seconds is None else float(ttl_seconds)
-    is_stale = ttl <= 0 or time.time() - stat.st_mtime > ttl
-    if is_stale and not allow_stale:
-        return None
-
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         if payload.get("version") != _DAILY_HISTORY_CACHE_VERSION:
             return None
+        acquired_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+        try:
+            parsed_acquired_at = datetime.fromisoformat(payload["created_at"])
+            # Legacy writers omitted their timezone. It cannot be recovered
+            # from the reading host after migration, so retain the mtime.
+            if parsed_acquired_at.tzinfo is not None:
+                acquired_at = parsed_acquired_at.astimezone(timezone.utc)
+        except (KeyError, TypeError, ValueError):
+            pass  # Legacy caches without a valid timestamp retain the mtime fallback.
+        is_stale = ttl <= 0 or time.time() - acquired_at.timestamp() > ttl
         frame = payload.get("frame")
         if not isinstance(frame, dict):
             return None
@@ -477,11 +637,28 @@ def _read_daily_history_cache(
         if not isinstance(columns, list) or not isinstance(data, list):
             return None
         df = pd.DataFrame(data, columns=columns)
+        acquired_phase = build_market_phase_context(
+            market=get_market_for_stock(str(payload.get("key", {}).get("code", ""))), current_time=acquired_at,
+        )
+        last_bar = _latest_daily_bar_date(df)
+        if (
+            acquired_phase.phase == MarketPhase.PREMARKET
+            and not pd.isna(last_bar)
+            and last_bar.date() > acquired_phase.effective_daily_bar_date
+        ):
+            df.attrs["daily_invalid_session"] = True
         metadata = payload.get("metadata")
         if isinstance(metadata, dict):
-            for key in ("daily_source", "daily_requested_source", "daily_source_order", "daily_source_order_notes", "source_errors", "daily_source_health"):
+            for key in ("daily_source", "daily_requested_source", "daily_source_order", "daily_source_order_notes", "source_errors", "daily_source_health", "daily_stale"):
                 if key in metadata:
                     df.attrs[key] = metadata[key]
+        is_stale = is_stale or daily_history_is_stale(
+            df,
+            code=str(payload.get("key", {}).get("code", "")),
+            fetched_at=acquired_at,
+        )
+        if is_stale and not allow_stale:
+            return None
         if is_stale:
             df.attrs["daily_stale"] = True
         return df
@@ -513,8 +690,9 @@ def _write_daily_history_cache(
                 "daily_source_order_notes": list(df.attrs.get("daily_source_order_notes", [])),
                 "source_errors": list(df.attrs.get("source_errors", [])),
                 "daily_source_health": df.attrs.get("daily_source_health", {}),
+                "daily_stale": bool(df.attrs.get("daily_stale")),
             },
-            "created_at": datetime.now().isoformat(),
+            "created_at": datetime.fromtimestamp(time.time(), tz=timezone.utc).isoformat(),
             "frame": json.loads(df.to_json(orient="split", date_format="iso", force_ascii=False)),
         }
         tmp_path = path.with_name(f".{path.name}.{time.time_ns()}.tmp")
@@ -1157,12 +1335,11 @@ def _compute_macd_status(close: pd.Series) -> str:
 def _compute_rsi(close: pd.Series, period: int = 14) -> float | None:
     if len(close) <= period:
         return None
-    delta = close.diff()
-    gain = delta.clip(lower=0).rolling(period).mean()
-    loss = (-delta.clip(upper=0)).rolling(period).mean()
-    rs = gain / loss.replace(0, pd.NA)
-    rsi = 100 - (100 / (1 + rs))
-    value = rsi.iloc[-1]
+    # 使用 Wilder 平滑（与 TA-Lib 一致），与 stock_analyzer / alert_indicators 的 RSI 口径保持一致。
+    close = close.astype(float)
+    if not close.diff().iloc[1:].ne(0).any():
+        return None
+    value = wilder_rsi(close, period).iloc[-1]
     if pd.isna(value):
         return None
     return float(value)

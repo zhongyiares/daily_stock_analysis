@@ -20,16 +20,20 @@ from typing import Optional, Dict, Any, List
 
 import pandas as pd
 
+from src.agent.provider_trace import resolved_model_provider_identity
 from src.config import get_config
 from src.report_language import normalize_report_language
 from src.search_service import SearchService
 from src.core.market_profile import get_profile, MarketProfile
 from src.core.market_strategy import get_market_strategy_blueprint
+from src.core.trading_calendar import get_market_now
 from src.llm.backend_registry import (
+    LOCAL_CLI_GENERATION_BACKEND_IDS,
+    LITELLM_BACKEND_ID,
     resolve_generation_backend_id,
     resolve_generation_fallback_backend_id,
 )
-from src.llm.generation_backend import GenerationError
+from src.llm.generation_backend import GenerationError, GenerationResult
 from src.schemas.market_light import MARKET_LIGHT_REGIONS, MarketLightSnapshot
 from src.services.run_diagnostics import record_llm_run, record_llm_run_started
 from src.services.intelligence_service import IntelligenceService
@@ -37,6 +41,7 @@ from data_provider.base import DataFetcherManager
 
 logger = logging.getLogger(__name__)
 
+_LEGACY_ANALYZER_BACKEND_ID = "legacy_analyzer"
 
 _ENGLISH_SECTION_PATTERNS = {
     "market_summary": r"###\s*(?:1\.\s*)?Market Summary",
@@ -140,19 +145,143 @@ class MarketAnalyzer:
         Args:
             search_service: 搜索服务实例
             analyzer: AI分析器实例（用于调用LLM）
-            region: 市场区域 cn=A股 hk=港股 us=美股 jp=日本 kr=韩国
+            region: 市场区域 cn=A股 hk=港股 us=美股 jp=日本 kr=韩国 tw=台股
             config: 本次复盘使用的配置；未传时读取全局配置
         """
         self.config = config or get_config()
         self.search_service = search_service
         self.analyzer = analyzer
         self.data_manager = DataFetcherManager()
-        self.region = region if region in ("cn", "us", "hk", "jp", "kr") else "cn"
+        self.region = region if region in ("cn", "us", "hk", "jp", "kr", "tw") else "cn"
         self.profile: MarketProfile = get_profile(self.region)
         self.strategy = get_market_strategy_blueprint(self.region)
 
     def _log_context(self) -> str:
         return f"component=market_review region={self.region}"
+
+    @staticmethod
+    def _resolve_configured_response_provider(
+        configured_model: str,
+        response_model: str,
+        model_list: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        """Match the actual response model against all deployments of one alias."""
+        normalized_configured_model = str(configured_model or "").strip()
+        normalized_response_model = str(response_model or "").strip().lower()
+        if not normalized_configured_model or not normalized_response_model or not model_list:
+            return ""
+
+        for entry in model_list:
+            params = entry.get("litellm_params", {}) or {}
+            model_name = str(entry.get("model_name") or "").strip()
+            if not model_name:
+                model_name = str(params.get("model") or "").strip()
+            if model_name != normalized_configured_model:
+                continue
+
+            deployment_model = str(params.get("model") or "").strip()
+            if deployment_model.lower() != normalized_response_model:
+                continue
+
+            normalized_deployment_model = deployment_model.lower()
+            if normalized_deployment_model.startswith("openai/~") or "openrouter" in normalized_deployment_model:
+                return "openrouter"
+
+            _resolved_model, resolved_provider = resolved_model_provider_identity(
+                deployment_model,
+            )
+            if resolved_provider:
+                return resolved_provider
+        return ""
+
+    def _resolve_recorded_provider(
+        self,
+        *,
+        provider: str,
+        model: str,
+        backend: str,
+        usage_provider: str = "",
+        response_model: str = "",
+    ) -> str:
+        """Resolve LiteLLM router aliases before persisting diagnostics."""
+        normalized_backend = str(backend or "").strip().lower()
+        normalized_model = str(model or "").strip()
+        normalized_usage_provider = str(usage_provider or "").strip()
+        normalized_response_model = str(response_model or "").strip()
+        normalized_provider = str(provider or "").strip()
+        resolved_route_provider = ""
+        if normalized_backend == "litellm" and normalized_model:
+            resolved_route_model, resolved_route_provider = resolved_model_provider_identity(
+                normalized_model,
+                getattr(self.config, "llm_model_list", None) or [],
+            )
+            normalized_route = str(resolved_route_model or normalized_model).strip().lower()
+            if normalized_route.startswith("openai/~") or "openrouter" in normalized_route:
+                resolved_route_provider = "openrouter"
+        resolved_response_provider = ""
+        if normalized_response_model:
+            resolved_response_provider = self._resolve_configured_response_provider(
+                normalized_model,
+                normalized_response_model,
+                getattr(self.config, "llm_model_list", None) or [],
+            )
+            if resolved_response_provider == "openrouter":
+                return resolved_response_provider
+        if normalized_usage_provider:
+            return normalized_usage_provider
+        if normalized_response_model:
+            if resolved_response_provider:
+                return resolved_response_provider
+            if resolved_route_provider == "openrouter":
+                return resolved_route_provider
+            _wire_model, resolved_provider = resolved_model_provider_identity(
+                normalized_response_model,
+            )
+            if resolved_provider:
+                return resolved_provider
+        if normalized_backend != "litellm" or not normalized_model:
+            return normalized_provider
+        return resolved_route_provider or normalized_provider or "openai"
+
+    def _resolve_recorded_error_model(
+        self,
+        *,
+        error: Any,
+        fallback_model: str = "",
+    ) -> str:
+        """Preserve route/model diagnostics for LiteLLM configuration failures."""
+        details = getattr(error, "details", None)
+        if isinstance(details, dict):
+            visited: set[int] = set()
+
+            def _find_error_model(payload: Dict[str, Any]) -> str:
+                payload_id = id(payload)
+                if payload_id in visited:
+                    return ""
+                visited.add(payload_id)
+                for key in ("last_model", "route_name"):
+                    candidate = str(payload.get(key) or "").strip()
+                    if candidate:
+                        return candidate
+                fallback_error = payload.get("fallback_error")
+                if isinstance(fallback_error, dict):
+                    nested_details = fallback_error.get("details")
+                    if isinstance(nested_details, dict):
+                        candidate = _find_error_model(nested_details)
+                        if candidate:
+                            return candidate
+                    return _find_error_model(fallback_error)
+                return ""
+
+            candidate = _find_error_model(details)
+            if candidate:
+                return candidate
+        backend = str(getattr(error, "backend", "") or "").strip()
+        configured_model = str(getattr(self.config, "litellm_model", "") or "").strip()
+        normalized_fallback_model = str(fallback_model or "").strip()
+        if backend == "litellm":
+            return normalized_fallback_model or configured_model or backend
+        return normalized_fallback_model or backend
 
     def _get_output_language(self) -> str:
         """Return the truthful report language (zh/en/ko) for payload and directives."""
@@ -179,6 +308,8 @@ class MarketAnalyzer:
             return "Japan market" if review_language == "en" else "日本市场"
         if self.region == "kr":
             return "Korea market" if review_language == "en" else "韩国市场"
+        if self.region == "tw":
+            return "Taiwan market" if review_language == "en" else "台股市场"
         if review_language == "en":
             return "A-share market"
         return "A股市场"
@@ -193,13 +324,15 @@ class MarketAnalyzer:
             return "JPY bn" if self._get_review_language() == "en" else "十亿日元"
         if self.region == "kr":
             return "KRW bn" if self._get_review_language() == "en" else "十亿韩元"
+        if self.region == "tw":
+            return "TWD bn" if self._get_review_language() == "en" else "十亿新台币"
         return "CNY 100m" if self._get_review_language() == "en" else "亿"
 
     def _format_turnover_value(self, amount_raw: float) -> str:
         """Format raw turnover according to market-specific units."""
         if amount_raw == 0.0:
             return "N/A"
-        if self.region in ("us", "hk", "jp", "kr"):
+        if self.region in ("us", "hk", "jp", "kr", "tw"):
             return f"{amount_raw / 1e9:.2f}"
         if amount_raw > 1e6:
             return f"{amount_raw / 1e8:.0f}"
@@ -220,9 +353,12 @@ class MarketAnalyzer:
                 "hk": "HK Market Recap",
                 "jp": "Japan Market Recap",
                 "kr": "Korea Market Recap",
+                "tw": "Taiwan Market Recap",
             }
             market_name = market_names.get(self.region, "A-share Market Recap")
             return f"## {date} {market_name}"
+        if self.region == "tw":
+            return f"## {date} 台股大盘复盘"
         return f"## {date} 大盘复盘"
 
     def _get_index_hint(self) -> str:
@@ -235,10 +371,29 @@ class MarketAnalyzer:
                 return "Analyze the key moves in the Nikkei 225, TOPIX, and other major Japanese indices."
             if self.region == "kr":
                 return "Analyze the key moves in the KOSPI, KOSDAQ, and other major Korean indices."
+            if self.region == "tw":
+                return "Analyze TAIEX and the TPEx index; disclose missing indices without inferring their moves."
             return "Analyze the price action in the SSE, SZSE, ChiNext, and other major indices."
         return self.profile.prompt_index_hint
 
     def _get_strategy_prompt_block(self) -> str:
+        if self.region == "tw" and self._get_review_language() == "en":
+            return """## Strategy Blueprint: Taiwan Index and News Recap
+Assess Taiwan market risk from available TAIEX/TPEx index data and verified news.
+
+### Strategy Principles
+- Check index coverage before comparing TAIEX and TPEx direction.
+- Distinguish semiconductor heavyweight signals from smaller-company themes.
+- Do not invent institutional flows, breadth, aggregate turnover, or sector rankings.
+
+### Analysis Dimensions
+- Index Structure: assess trend and divergence only for indices with available data.
+- News Catalysts: examine sourced semiconductor, export-chain, and global technology news.
+
+### Action Framework
+- Risk-on: available indices and news align; state data limitations.
+- Neutral: indices diverge or coverage is incomplete; wait for confirmation.
+- Risk-off: indices weaken or external risk rises; prioritize drawdown control."""
         if self.region == "hk" and self._get_review_language() == "en":
             return """## Strategy Blueprint: Hong Kong Market Regime Strategy
 Focus on HSI trend, southbound flow dynamics, and sector rotation to define next-session risk posture.
@@ -369,6 +524,12 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 
     def _get_strategy_markdown_block(self, review_language: str | None = None) -> str:
         review_language = review_language or self._get_review_language()
+        if self.region == "tw" and review_language == "en":
+            return """### 6. Strategy Framework
+- **Index Structure**: Assess TAIEX/TPEx direction using available data; disclose missing coverage.
+- **News Catalysts**: Follow verified semiconductor, export-chain, and global technology news.
+- **Data Limits**: No market breadth, institutional flows, aggregate turnover, or sector rankings.
+"""
         if self.region == "hk" and review_language == "en":
             return """### 6. Strategy Framework
 - **Trend Regime**: Classify the market as momentum, range, or risk-off based on HSI/HSTECH/HSCEI alignment.
@@ -428,7 +589,8 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         Returns:
             MarketOverview: 市场概览数据对象
         """
-        today = datetime.now().strftime('%Y-%m-%d')
+        now = get_market_now("tw") if self.region == "tw" else datetime.now()
+        today = now.strftime('%Y-%m-%d')
         overview = MarketOverview(date=today)
         
         # 1. 获取主要指数行情（按 region 切换 A 股/美股）
@@ -615,6 +777,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             "hk": "港股市场" if review_language == "zh" else "HK market",
             "jp": "日本股市" if review_language == "zh" else "Japan stock market",
             "kr": "韩国股市" if review_language == "zh" else "Korea stock market",
+            "tw": "台股市场" if review_language == "zh" else "Taiwan stock market",
         }
         
         try:
@@ -669,8 +832,8 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             )
             record_llm_run(
                 success=False,
-                provider="litellm",
-                model=getattr(self.config, "litellm_model", None),
+                provider=backend_error.provider or backend_error.backend,
+                model=self._resolve_recorded_error_model(error=backend_error),
                 call_type="market_review",
                 error_type=type(backend_error).__name__,
                 error_message=backend_error,
@@ -682,26 +845,54 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 "[大盘] %s action=generate_review status=fallback_template reason=no_analyzer",
                 self._log_context(),
             )
-            return self._generate_template_review(overview, news)
+            return self._with_tw_index_coverage(self._generate_template_review(overview, news), overview)
 
         # 构建 Prompt
         prompt = self._build_review_prompt(overview, news)
 
         logger.info("[大盘] %s action=generate_review status=start", self._log_context())
-        # Use the public generate_text() entry point - never access private analyzer attributes.
+        # Use public analyzer APIs so diagnostics reflect the actual execution backend.
         llm_started_at = time.perf_counter()
+        provider, model = self._get_analyzer_generation_backend_identity()
         try:
             record_llm_run_started(
-                provider="litellm",
-                model=getattr(self.config, "litellm_model", None),
+                provider=provider,
+                model=model,
                 call_type="market_review",
             )
-            review = self.analyzer.generate_text(prompt, max_tokens=8192, temperature=0.7)
+            generation_result = self._generate_market_review_with_metadata(
+                prompt,
+                provider=provider,
+                model=model,
+            )
+            review = generation_result.text if generation_result else None
+            generation_diagnostics = (
+                getattr(generation_result, "diagnostics", None) if generation_result is not None else None
+            )
+            if generation_result is not None:
+                model = generation_result.model or model
+                usage_payload = getattr(generation_result, "usage", None)
+                provider = self._resolve_recorded_provider(
+                    provider=generation_result.provider or generation_result.backend or provider,
+                    model=model,
+                    backend=generation_result.backend or "",
+                    usage_provider=(
+                        usage_payload.get("provider") if isinstance(usage_payload, dict) else ""
+                    ),
+                    response_model=(
+                        usage_payload.get("response_model") if isinstance(usage_payload, dict) else ""
+                    ),
+                )
         except Exception as exc:
+            error_provider = getattr(exc, "provider", None) or getattr(exc, "backend", None) or provider
+            error_model = self._resolve_recorded_error_model(
+                error=exc,
+                fallback_model=model,
+            )
             record_llm_run(
                 success=False,
-                provider="litellm",
-                model=getattr(self.config, "litellm_model", None),
+                provider=error_provider,
+                model=error_model,
                 call_type="market_review",
                 duration_ms=int((time.perf_counter() - llm_started_at) * 1000),
                 error_type=type(exc).__name__,
@@ -709,14 +900,26 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             )
             raise
 
+        failed_all_models = (
+            isinstance(generation_diagnostics, dict)
+            and generation_diagnostics.get("reason") == "all_models_failed"
+        )
         record_llm_run(
             success=bool(review),
-            provider="litellm",
-            model=getattr(self.config, "litellm_model", None),
+            provider=provider,
+            model=model,
             call_type="market_review",
             duration_ms=int((time.perf_counter() - llm_started_at) * 1000),
-            error_type=None if review else "EmptyResponse",
-            error_message=None if review else "empty market review response",
+            error_type=None if review else ("AllModelsFailed" if failed_all_models else "EmptyResponse"),
+            error_message=(
+                None
+                if review
+                else (
+                    generation_diagnostics
+                    if failed_all_models
+                    else "empty market review response"
+                )
+            ),
         )
 
         if review:
@@ -726,13 +929,29 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 len(review),
             )
             # Inject structured data tables into LLM prose sections
-            return self._inject_data_into_review(review, overview, news)
+            return self._with_tw_index_coverage(self._inject_data_into_review(review, overview, news), overview)
 
         logger.warning(
             "[大盘] %s action=generate_review status=fallback_template reason=empty_llm_response",
             self._log_context(),
         )
-        return self._generate_template_review(overview, news)
+        return self._with_tw_index_coverage(self._generate_template_review(overview, news), overview)
+
+    def _tw_index_coverage_lines(self, overview: MarketOverview) -> List[str]:
+        """Keep missing Taiwan index coverage explicit even when an LLM omits it."""
+        if self.region != "tw":
+            return []
+        available = {index.code for index in overview.indices}
+        missing = [code for code in ("TWII", "TWOII") if code not in available]
+        suffix = {"zh": "行情缺失", "en": "data unavailable", "ko": "데이터 없음"}[self._get_output_language()]
+        return [f"- {code}: {suffix}" for code in missing]
+
+    def _with_tw_index_coverage(self, report: str, overview: MarketOverview) -> str:
+        lines = self._tw_index_coverage_lines(overview)
+        if not lines:
+            return report
+        title = {"zh": "数据边界", "en": "Data Limits", "ko": "데이터 한계"}[self._get_output_language()]
+        return f"{report.rstrip()}\n\n### {title}\n" + "\n".join(lines) + "\n"
 
     def _get_analyzer_generation_backend_config_error(self) -> Optional[GenerationError]:
         """Return analyzer backend config errors without relying on dynamic mock attributes."""
@@ -751,6 +970,74 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             return None
         error = method()
         return error if isinstance(error, GenerationError) else None
+
+    def _get_configured_generation_backend_identity(self) -> tuple[str, str]:
+        """Best-effort backend identity for legacy analyzers without metadata APIs."""
+        backend_id = str(getattr(self.config, "generation_backend", "") or "").strip().lower()
+        if not backend_id:
+            backend_id = LITELLM_BACKEND_ID
+        if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
+            return backend_id, backend_id
+        return backend_id, str(getattr(self.config, "litellm_model", "") or "")
+
+    def _get_legacy_analyzer_generation_backend_identity(self) -> tuple[str, str]:
+        """Return a neutral identity for injected analyzers that expose no metadata APIs."""
+        return _LEGACY_ANALYZER_BACKEND_ID, _LEGACY_ANALYZER_BACKEND_ID
+
+    def _get_analyzer_generation_backend_identity(self) -> tuple[str, str]:
+        """Use analyzer metadata API when available, otherwise fall back to configured identity."""
+        if self.analyzer is None:
+            return self._get_configured_generation_backend_identity()
+        missing = object()
+        if getattr_static(self.analyzer, "get_generation_backend_identity", missing) is not missing:
+            method = getattr(self.analyzer, "get_generation_backend_identity", None)
+            if callable(method):
+                return method()
+        return self._get_legacy_analyzer_generation_backend_identity()
+
+    def _generate_market_review_with_metadata(
+        self,
+        prompt: str,
+        *,
+        provider: str,
+        model: str,
+    ) -> Optional[GenerationResult]:
+        """Support legacy analyzers that only implement the public generate_text() contract."""
+        if self.analyzer is None:
+            return None
+        missing = object()
+        if getattr_static(self.analyzer, "generate_text_with_metadata", missing) is not missing:
+            method = getattr(self.analyzer, "generate_text_with_metadata", None)
+            if callable(method):
+                return method(
+                    prompt,
+                    max_tokens=8192,
+                    temperature=0.7,
+                )
+
+        if getattr_static(self.analyzer, "generate_text", missing) is missing:
+            raise AttributeError(
+                "analyzer must implement generate_text_with_metadata() or generate_text()"
+            )
+        legacy_method = getattr(self.analyzer, "generate_text", None)
+        if not callable(legacy_method):
+            raise AttributeError(
+                "analyzer must implement generate_text_with_metadata() or generate_text()"
+            )
+        review = legacy_method(
+            prompt,
+            max_tokens=8192,
+            temperature=0.7,
+        )
+        if review is None:
+            return None
+        return GenerationResult(
+            text=review,
+            provider=provider,
+            model=model,
+            backend=provider,
+            usage={},
+        )
 
     def build_market_review_payload(
         self,
@@ -1013,6 +1300,16 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             )
         return "\n".join(lines)
 
+    @staticmethod
+    def _get_directional_index_changes(overview: MarketOverview) -> List[float]:
+        """Exclude VIX volatility returns from the directional index average."""
+        return [
+            idx.change_pct
+            for idx in overview.indices
+            if idx.change_pct is not None
+            and str(idx.code or "").strip().upper() not in {"VIX", "^VIX"}
+        ]
+
     def build_market_light_snapshot(self, overview: MarketOverview) -> Dict[str, Any]:
         """Build a deterministic market-light snapshot from structured breadth data."""
         scores = self._build_market_light_scores(overview)
@@ -1075,7 +1372,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 reasons.append(f"上涨家数占比 {up_ratio:.0%}，亏钱效应较强")
             else:
                 reasons.append(f"上涨家数占比 {up_ratio:.0%}，市场分化")
-        index_changes = [idx.change_pct for idx in overview.indices if idx.change_pct is not None]
+        index_changes = self._get_directional_index_changes(overview)
         if index_changes:
             avg_change = sum(index_changes) / len(index_changes)
             reasons.append(f"主要指数平均涨跌幅 {avg_change:+.2f}%")
@@ -1098,7 +1395,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 reasons.append(f"advancers ratio {up_ratio:.0%}, downside pressure dominates")
             else:
                 reasons.append(f"advancers ratio {up_ratio:.0%}, breadth is mixed")
-        index_changes = [idx.change_pct for idx in overview.indices if idx.change_pct is not None]
+        index_changes = self._get_directional_index_changes(overview)
         if index_changes:
             avg_change = sum(index_changes) / len(index_changes)
             reasons.append(f"average major-index change {avg_change:+.2f}%")
@@ -1121,7 +1418,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             ]
         else:
             lines = [
-                "| 指数 | 最新 | 涨跌幅 | 开盘 | 最高 | 最低 | 振幅 | 成交额(亿) |",
+                f"| 指数 | 最新 | 涨跌幅 | 开盘 | 最高 | 最低 | 振幅 | 成交额({self._get_turnover_unit_label() if self.region == 'tw' else '亿'}) |",
                 "|------|------|--------|------|------|------|------|-----------|",
             ]
         for idx in overview.indices:
@@ -1277,8 +1574,8 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         if breadth_available:
             breadth_score = int(overview.up_count / participants * 100)
 
-        index_changes = [idx.change_pct for idx in overview.indices if idx.change_pct is not None]
-        index_available = bool(overview.indices and index_changes)
+        index_changes = self._get_directional_index_changes(overview)
+        index_available = bool(index_changes)
         index_score = 50
         if index_available:
             avg_change = sum(index_changes) / len(index_changes)
@@ -1464,7 +1761,7 @@ Industry lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}
 Concept leading: {top_concepts_text if top_concepts_text else "N/A"}
 Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
 
-            data_limit_lines = []
+            data_limit_lines = self._tw_index_coverage_lines(overview)
             if not self.profile.has_market_stats:
                 data_limit_lines.append(
                     "- Market breadth, aggregate turnover, participation, and fund-flow signals are not available for this market."
@@ -1487,7 +1784,7 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
 概念领涨: {top_concepts_text if top_concepts_text else "暂无数据"}
 概念领跌: {bottom_concepts_text if bottom_concepts_text else "暂无数据"}"""
 
-            data_limit_lines = []
+            data_limit_lines = self._tw_index_coverage_lines(overview)
             if not self.profile.has_market_stats:
                 data_limit_lines.append("- 该市场暂无涨跌家数、涨跌停、成交额汇总、参与度或资金流信号。")
             if not self.profile.has_sector_rankings:
@@ -1535,7 +1832,7 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
         output_template_sections = self._build_output_template_sections(review_language)
         zh_market_scope_name = self._get_market_scope_name("zh")
         zh_report_title = f"{overview.date} 大盘复盘"
-        if self.region in ("jp", "kr"):
+        if self.region in ("jp", "kr", "tw"):
             zh_report_title = f"{overview.date} {zh_market_scope_name}大盘复盘"
         workflow_hint = (
             "报告要像交易员盘后工作台：先给结论，再按数据表、主线、催化、计划展开"
@@ -1677,6 +1974,8 @@ Output the report content directly, no extra commentary.
                 market_mood = self._get_market_mood_text("mild_down", template_language)
             else:
                 market_mood = self._get_market_mood_text("strong_down", template_language)
+        elif self.region == "tw":
+            market_mood = "insufficient index data" if template_language == "en" else "指数数据不足"
         else:
             market_mood = self._get_market_mood_text("range", template_language)
         
@@ -1716,6 +2015,7 @@ Output the report content directly, no extra commentary.
                 "hk": "HK Market Recap",
                 "jp": "Japan Market Recap",
                 "kr": "Korea Market Recap",
+                "tw": "Taiwan Market Recap",
             }
             market_name = market_names.get(self.region, "A-share Market Recap")
             report = f"""## {overview.date} {market_name}
@@ -1737,7 +2037,7 @@ Market conditions can change quickly. The data above is for reference only and d
 """
             return report
 
-        market_labels = {"cn": "A股", "us": "美股", "hk": "港股", "jp": "日股", "kr": "韩股"}
+        market_labels = {"cn": "A股", "us": "美股", "hk": "港股", "jp": "日股", "kr": "韩股", "tw": "台股"}
         market_label = market_labels.get(self.region, "A股")
         dashboard_block = (
             self._build_stats_block(overview)
@@ -1776,7 +2076,7 @@ Market conditions can change quickly. The data above is for reference only and d
             if self.profile.has_market_stats
             else ""
         )
-        return f"""## {overview.date} 大盘复盘
+        return f"""{self._get_review_title(overview.date)}
 
 > 今日{market_label}市场整体呈现**{market_mood}**态势，优先观察{summary_focus}。
 

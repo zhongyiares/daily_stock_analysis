@@ -15,9 +15,11 @@ from api.v1.endpoints import (
     agent,
     alerts,
     screening,
+    market_sentiment,
     analysis,
     auth,
     backtest,
+    data,
     decision_signals,
     health,
     history,
@@ -102,6 +104,18 @@ router.include_router(
     screening.router,
     prefix="/screening",
     tags=["Screening"]
+)
+
+router.include_router(
+    market_sentiment.router,
+    prefix="/market-sentiment",
+    tags=["Market Sentiment"],
+)
+
+router.include_router(
+    data.router,
+    prefix="/data",
+    tags=["Data"]
 )
 
 router.include_router(

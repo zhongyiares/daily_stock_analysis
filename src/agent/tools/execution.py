@@ -14,7 +14,7 @@ import logging
 import re
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Iterable, List, Optional
 
 from src.agent.tools.registry import ToolRegistry
@@ -104,6 +104,14 @@ class ToolAccessContext:
     max_result_bytes: Optional[int] = None
     redact_result: bool = False
     audit_context: Dict[str, Any] = field(default_factory=dict)
+    stock_identity: Any = None  # validated once, bound only for this handler call
+    analysis_target: Any = None
+
+
+@dataclass(frozen=True)
+class ToolStockAccess:
+    identity: Any
+    target: Any
 
 
 class ToolExecutionCancelled(Exception):
@@ -112,6 +120,28 @@ class ToolExecutionCancelled(Exception):
 
 class ToolExecutionDeadlineExceeded(Exception):
     """Raised at a cooperative checkpoint after the tool deadline expires."""
+
+
+def get_tool_stock_identity(stock_code: str) -> Any:
+    """Return a strict handler's validated identity, never reparse its registry."""
+    context = _ACTIVE_TOOL_CONTEXT.get()
+    if context is None or not getattr(context.stock_scope, "strict", False):
+        return None
+    identity = context.stock_identity
+    if identity is None or stock_code != identity.stock_code:
+        raise ValueError("Strict tool handler lost its validated stock identity")
+    return identity
+
+
+def get_tool_analysis_target(stock_code: str) -> Any:
+    """Strict consumers must retain the boundary's target, not reclassify it."""
+    identity = get_tool_stock_identity(stock_code)
+    if identity is None:
+        return None
+    target = _ACTIVE_TOOL_CONTEXT.get().analysis_target
+    if target is None or target.canonical_id != identity.canonical_id or target.asset_type != identity.asset_type:
+        raise ValueError("Strict tool handler lost its validated analysis target")
+    return target
 
 
 _ACTIVE_TOOL_CONTEXT: contextvars.ContextVar[Optional[ToolAccessContext]] = contextvars.ContextVar(
@@ -169,45 +199,90 @@ def serialize_tool_result(result: Any) -> str:
     return str(result)
 
 
-def _normalize_tool_stock_code(value: Any) -> Any:
-    """Canonicalize stock code arguments so equivalent HK variants share one cache key."""
+def _normalize_tool_stock_code(value: Any, registry: Optional[Any] = None) -> Any:
+    """Canonicalize a stock argument for tool scope and cache keys.
+
+    An injected registry preserves exact parser INDEX canonicals. Direct calls
+    without one retain the legacy stock/HK normalization path.
+    """
     if not isinstance(value, str):
         return value
 
-    text = value.strip().upper()
+    text = value.strip()
     if not text:
         return text
 
-    if text.endswith(".HK"):
-        base = text[:-3]
+    if registry is not None:
+        try:
+            from src.services.stock_list_parser import ParseStatus, parse_analysis_target
+
+            target = parse_analysis_target(text, registry)
+            if target.asset_type == ParseStatus.INDEX and target.canonical_id:
+                return target.canonical_id
+        except Exception:
+            # Registry malformed/unavailable — fall through to the stock path.
+            pass
+
+    upper = text.upper()
+    if upper.endswith(".HK"):
+        base = upper[:-3]
         if base.isdigit() and 1 <= len(base) <= 5:
             return f"HK{base.zfill(5)}"
 
-    if text.startswith("HK"):
-        base = text[2:]
+    if upper.startswith("HK"):
+        base = upper[2:]
         if base.isdigit() and 1 <= len(base) <= 5:
             return f"HK{base.zfill(5)}"
 
-    if text.isdigit() and len(text) == 5:
-        return f"HK{text}"
+    if upper.isdigit() and len(upper) == 5:
+        return f"HK{upper}"
 
     try:
         from data_provider.base import canonical_stock_code, normalize_stock_code
 
-        return canonical_stock_code(normalize_stock_code(text))
+        return canonical_stock_code(normalize_stock_code(upper))
     except Exception:
-        return text
+        return upper
 
 
-def _build_tool_cache_key(tool_name: str, arguments: Dict[str, Any]) -> Optional[str]:
-    """Build a stable cache key for tool calls with normalized stock-code arguments."""
+def _default_index_registry_or_none() -> Optional[Any]:
+    """Return the default IndexRegistry, failing open to stock semantics."""
+    try:
+        from src.services.stock_list_parser import default_index_registry
+
+        return default_index_registry()
+    except Exception:
+        return None
+
+
+def _build_tool_cache_key(
+    tool_name: str, arguments: Dict[str, Any], *, stock_scope: Any = None,
+    resolved_identity: Any = None,
+) -> Optional[str]:
+    """Build a stable cache key without folding index and bare-stock identities."""
     if not isinstance(arguments, dict):
         return None
+
+    if getattr(stock_scope, "strict", False) and "stock_code" in arguments:
+        if resolved_identity is None:
+            try:
+                resolved_identity = _validated_chat_tool_identity(
+                    stock_scope, arguments["stock_code"], _default_index_registry_or_none(),
+                )
+            except (ValueError, LookupError):
+                return None
+        normalized = dict(arguments, stock_code=resolved_identity.stock_code,
+                          _stock_identity=resolved_identity.as_payload())
+        return f"{tool_name}:{json.dumps(normalized, ensure_ascii=False, sort_keys=True, default=str)}"
+
+    registry = None
+    if "stock_code" in arguments:
+        registry = _default_index_registry_or_none()
 
     normalized_args: Dict[str, Any] = {}
     for key, value in arguments.items():
         if key == "stock_code":
-            normalized_args[key] = _normalize_tool_stock_code(value)
+            normalized_args[key] = _normalize_tool_stock_code(value, registry)
         else:
             normalized_args[key] = value
 
@@ -234,13 +309,13 @@ def _is_stock_scoped_tool(tool_registry: ToolRegistry, tool_name: str) -> bool:
     return any(param.name == "stock_code" for param in tool_def.parameters)
 
 
-def _normalize_guard_stock_code(value: Any) -> str:
+def _normalize_guard_stock_code(value: Any, registry: Optional[Any] = None) -> str:
     if value is None:
         return ""
     if isinstance(value, float) and value.is_integer():
         value = int(value)
     raw = value if isinstance(value, str) else str(value)
-    normalized = _normalize_tool_stock_code(raw)
+    normalized = _normalize_tool_stock_code(raw, registry)
     return normalized if isinstance(normalized, str) else str(normalized)
 
 
@@ -253,24 +328,84 @@ def _guard_tool_stock_scope(
     tool_name: str,
     arguments: Dict[str, Any],
     stock_scope: Any,
+    index_registry: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
-    if stock_scope is None or not isinstance(arguments, dict):
-        return None
-    if not _is_stock_scoped_tool(tool_registry, tool_name):
-        return None
-    if "stock_code" not in arguments:
-        return None
+    """Enforce one tool stock argument against the active canonical scope."""
+    return _resolve_tool_stock_access(
+        tool_registry, tool_name, arguments, stock_scope, index_registry,
+    )[0]
 
-    requested = _normalize_guard_stock_code(arguments.get("stock_code"))
-    expected = _normalize_guard_stock_code(getattr(stock_scope, "expected_stock_code", ""))
+
+def _validated_chat_tool_identity(stock_scope: Any, value: str, registry: Any) -> Any:
+    return _validated_chat_tool_target(stock_scope, value, registry).identity
+
+
+def _validated_chat_tool_target(stock_scope: Any, value: str, registry: Any) -> ToolStockAccess:
+    from src.agent.stock_scope import StockIdentity
+    from src.services.stock_list_parser import _normalize_index_key, parse_analysis_target
+
+    if registry is None or not isinstance(value, str) or not value.strip():
+        raise ValueError("Tool target cannot be validated")
+    target = parse_analysis_target(value, registry)
+    requested = StockIdentity.from_target(target, registry)
+    if requested not in stock_scope.identities:
+        # Detect a requested accepted index that has silently become a stock.
+        # Unrelated scope members are deliberately not revalidated here.
+        if any(_normalize_index_key(value) in {_normalize_index_key(item.stock_code),
+                                              _normalize_index_key(item.canonical_id)}
+               for item in stock_scope.identities):
+            raise ValueError("Accepted Chat identity changed in execution registry")
+        raise LookupError("Tool call is outside the accepted Chat scope")
+    accepted = next(item for item in stock_scope.identities if item == requested)
+    identity = replace(accepted, stock_name=accepted.stock_name or requested.stock_name)
+    return ToolStockAccess(identity, replace(target, raw_input=identity.stock_code))
+
+
+def _resolve_tool_stock_access(
+    tool_registry: ToolRegistry, tool_name: str, arguments: Dict[str, Any],
+    stock_scope: Any, index_registry: Optional[Any] = None,
+) -> tuple[Optional[Dict[str, Any]], Any]:
+    if stock_scope is None or not isinstance(arguments, dict):
+        return None, None
+    if not _is_stock_scoped_tool(tool_registry, tool_name):
+        return None, None
+    if "stock_code" not in arguments:
+        if not getattr(stock_scope, "strict", False):
+            return None, None
+        return {"error": "stock_scope_violation", "retriable": False}, None
+
+    if index_registry is None:
+        index_registry = _default_index_registry_or_none()
+
+    if getattr(stock_scope, "strict", False):
+        details = {"expected_stock_code": stock_scope.expected_stock_code,
+                   "requested_stock_code": arguments.get("stock_code"),
+                   "allowed_stock_codes": sorted(stock_scope.allowed_stock_codes), "retriable": False}
+        try:
+            access = _validated_chat_tool_target(stock_scope, arguments.get("stock_code"), index_registry)
+        except LookupError:
+            return dict(details, error="stock_scope_violation"), None
+        except ValueError:
+            return dict(details, error="stock_identity_unavailable"), None
+        supported = tool_registry.resolve(tool_name).policy.supported_asset_types
+        if supported is None:
+            return dict(details, error="stock_tool_contract_unknown"), None
+        if access.identity.asset_type not in supported:
+            return dict(details, error="stock_tool_unsupported"), None
+        return None, access
+
+    requested = _normalize_guard_stock_code(arguments.get("stock_code"), index_registry)
+    expected = _normalize_guard_stock_code(
+        getattr(stock_scope, "expected_stock_code", ""), index_registry
+    )
     allowed = {
         normalized
         for code in _iter_allowed_stock_codes(stock_scope)
-        for normalized in [_normalize_guard_stock_code(code)]
+        for normalized in [_normalize_guard_stock_code(code, index_registry)]
         if normalized
     }
     if requested and (requested == expected or requested in allowed):
-        return None
+        return None, None
 
     return {
         "error": "stock_scope_violation",
@@ -278,7 +413,7 @@ def _guard_tool_stock_scope(
         "requested_stock_code": requested,
         "allowed_stock_codes": sorted(allowed),
         "retriable": False,
-    }
+    }, None
 
 
 def _normalize_secret_key(key: Any) -> str:
@@ -349,8 +484,13 @@ def execute_runner_tool_call(
 ) -> tuple[Any, str, bool, float, bool, Optional[Dict[str, Any]]]:
     """Execute a single tool call using the legacy runner semantics."""
     t0 = time.time()
-    cache_key = _build_tool_cache_key(tool_call.name, tool_call.arguments)
-    guard_result = _guard_tool_stock_scope(tool_registry, tool_call.name, tool_call.arguments, stock_scope)
+    guard_result, access = _resolve_tool_stock_access(
+        tool_registry, tool_call.name, tool_call.arguments, stock_scope,
+    )
+    identity = access.identity if access is not None else None
+    cache_key = (None if guard_result is not None and getattr(stock_scope, "strict", False)
+                 else _build_tool_cache_key(tool_call.name, tool_call.arguments,
+                                            stock_scope=stock_scope, resolved_identity=identity))
     if guard_result is not None:
         dur = round(time.time() - t0, 2)
         result_str = serialize_tool_result(guard_result)
@@ -374,16 +514,31 @@ def execute_runner_tool_call(
         )
         return tool_call, non_retriable_tool_results[cache_key], False, dur, True, None
 
+    context_token = None
+    arguments = tool_call.arguments
+    if identity is not None:
+        arguments = dict(arguments, stock_code=identity.stock_code)
+        context_token = bind_tool_execution_context(ToolAccessContext(
+            stock_scope=stock_scope, stock_identity=identity, analysis_target=access.target,
+        ))
     try:
-        res = tool_registry.execute(tool_call.name, **tool_call.arguments)
+        res = tool_registry.execute(tool_call.name, **arguments)
         res_str = serialize_tool_result(res)
-        ok = True
+        # Handlers can report failure without raising. Empty or partial data
+        # alone does not make a tool call unsuccessful.
+        ok = not (
+            isinstance(res, dict)
+            and (bool(res.get("error")) or res.get("success") is False)
+        )
         if cache_key and non_retriable_tool_results is not None and _is_non_retriable_tool_result(res):
             non_retriable_tool_results[cache_key] = res_str
     except Exception as e:
         res_str = json.dumps({"error": str(e)})
         ok = False
         logger.warning("Tool '%s' failed: %s", tool_call.name, e)
+    finally:
+        if context_token is not None:
+            reset_tool_execution_context(context_token)
     dur = round(time.time() - t0, 2)
     return tool_call, res_str, ok, dur, False, None
 

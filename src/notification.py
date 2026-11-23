@@ -410,6 +410,32 @@ class NotificationService(
         self._history_compare_cache[cache_key] = history_by_code
         return {"history_by_code": history_by_code}
 
+    @staticmethod
+    def _empty_news_disclosure(result: "AnalysisResult", language: str = "zh") -> Optional[str]:
+        """新闻检索未执行或零命中时返回对应披露文案。
+
+        判定与文案由 src/services/empty_news 统一持有；字符串拼接渲染器与模板
+        渲染链路共用同一实现，避免同一份分析结果在部分渠道披露、另一些渠道沉默。
+        """
+        from src.services.empty_news import empty_news_disclosure
+
+        return empty_news_disclosure(result, language)
+
+    @staticmethod
+    def _append_data_sources_line(
+        lines: List[str],
+        result: AnalysisResult,
+        labels: Dict[str, str],
+    ) -> bool:
+        data_sources = getattr(result, "data_sources", None)
+        if not isinstance(data_sources, str):
+            return False
+        data_sources = data_sources.strip()
+        if not data_sources:
+            return False
+        lines.append(f"*📋 {labels['data_sources_label']}：{data_sources}*")
+        return True
+
     def generate_aggregate_report(
         self,
         results: List[AnalysisResult],
@@ -630,11 +656,12 @@ class NotificationService(
 
     # ===== Context channel =====
     def _has_context_channel(self) -> bool:
-        """判断是否存在基于消息上下文的临时渠道（如钉钉会话、飞书会话）"""
+        """判断是否存在基于消息上下文的临时渠道（如钉钉会话、飞书会话、企微智能机器人会话）"""
         return (
             self._extract_dingtalk_session_webhook() is not None
             or self._extract_feishu_reply_info() is not None
             or self._extract_telegram_context_chat_id() is not None
+            or self._extract_wecom_aibot_context() is not None
         )
 
     def _source_platform(self) -> str:
@@ -667,6 +694,26 @@ class NotificationService(
     def should_broadcast_static_channels(self) -> bool:
         """Whether static notification channels should receive this dispatch."""
         return not self._has_context_channel()
+
+    def _extract_wecom_aibot_context(self) -> Optional[Dict[str, str]]:
+        """从来源消息中提取企微智能机器人会话标识（用于 aibot_send_msg 异步回复）。
+
+        会话键：群聊为回调帧携带的 chatid，单聊为 from.userid（官方协议：单聊
+        主动推送 chatid 即填用户 userid；非超管创建的机器人该值为密文，原样
+        透传——见 bot/platforms/wecom_aibot.py 的已知限制说明）。
+        """
+        if not isinstance(self._source_message, BotMessage):
+            return None
+        if self._source_platform() != "wecom":
+            return None
+        raw_data = getattr(self._source_message, "raw_data", {}) or {}
+        for candidate in (
+            getattr(self._source_message, "chat_id", ""),
+            raw_data.get("_wecom_chat_id") if isinstance(raw_data, dict) else None,
+        ):
+            if isinstance(candidate, str) and candidate.strip():
+                return {"chat_id": candidate.strip()}
+        return None
 
     def _extract_dingtalk_session_webhook(self) -> Optional[str]:
         """从来源消息中提取钉钉会话 Webhook（用于 Stream 模式回复）"""
@@ -755,7 +802,58 @@ class NotificationService(
             except Exception as e:
                 logger.error(f"Telegram 上下文会话推送异常: {e}")
 
+        # 尝试企微智能机器人会话上下文（aibot_send_msg 回来源会话）
+        wecom_context = self._extract_wecom_aibot_context()
+        if wecom_context:
+            try:
+                if self._send_wecom_aibot_reply(
+                    wecom_context["chat_id"], content
+                ):
+                    logger.info("已通过企微智能机器人会话推送报告")
+                    success = True
+                else:
+                    logger.error("企微智能机器人会话推送失败")
+            except Exception as e:
+                logger.error(f"企微智能机器人会话推送异常: {e}")
+
         return success
+
+    def _send_wecom_aibot_reply(self, chat_id: str, content: str) -> bool:
+        """通过企微智能机器人长连接（aibot_send_msg）发送消息到来源会话。
+
+        前置条件（官方协议）：目标用户/会话须先与机器人建过会话；长连接客户端
+        须在运行（WECOM_AIBOT_ENABLED=true 且 SDK 可用）。违反时由适配器回执
+        errcode 非零并记日志，此处按失败返回。
+        """
+        try:
+            from bot.platforms.wecom_aibot import (
+                WECOM_AIBOT_SDK_AVAILABLE,
+                get_wecom_aibot_client,
+            )
+            if not WECOM_AIBOT_SDK_AVAILABLE:
+                logger.warning("企微智能机器人 SDK 不可用，无法回推来源会话")
+                return False
+
+            client = get_wecom_aibot_client()
+            if client is None:
+                logger.warning(
+                    "企微智能机器人客户端未就绪（未启用或未配置"
+                    " WECOM_AIBOT_BOT_ID/WECOM_AIBOT_SECRET），无法回推来源会话"
+                )
+                return False
+
+            sanitized_content = strip_hidden_markdown_metadata(content).strip()
+            if not sanitized_content:
+                logger.warning("企微智能机器人回推内容为空，跳过")
+                return False
+
+            return client.send_to_chat(chat_id, sanitized_content)
+        except ImportError as e:
+            logger.error(f"导入企微智能机器人模块失败: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"企微智能机器人会话回复异常: {e}")
+            return False
 
     def _send_feishu_stream_reply(self, chat_id: str, content: str) -> bool:
         """
@@ -938,6 +1036,9 @@ class NotificationService(
                     f"{labels['score_label']} {r.sentiment_score} | "
                     f"{localize_trend_prediction(r.trend_prediction, report_language)}"
                 )
+                news_disclosure = self._empty_news_disclosure(r, report_language)
+                if news_disclosure:
+                    report_lines.append(news_disclosure)
         else:
             report_lines.extend([f"## 📈 {labels['report_title']}", ""])
             # 逐个股票的详细分析
@@ -1031,12 +1132,13 @@ class NotificationService(
                     news_lines.append(f"**市场情绪**：{result.market_sentiment}")
                 if hasattr(result, 'hot_topics') and result.hot_topics:
                     news_lines.append(f"**相关热点**：{result.hot_topics}")
-                if news_lines:
-                    report_lines.extend([
-                        "#### 📰 消息面/情绪面",
-                        *news_lines,
-                        "",
-                    ])
+                news_disclosure = self._empty_news_disclosure(result, report_language)
+                if news_lines or news_disclosure:
+                    report_lines.append("#### 📰 消息面/情绪面")
+                    if news_disclosure:
+                        report_lines.append(news_disclosure)
+                    report_lines.extend(news_lines)
+                    report_lines.append("")
 
                 # 综合分析
                 if result.analysis_summary:
@@ -1056,8 +1158,7 @@ class NotificationService(
                 # 数据来源说明
                 if hasattr(result, 'search_performed') and result.search_performed:
                     report_lines.append("*🔍 已执行联网搜索*")
-                if hasattr(result, 'data_sources') and result.data_sources:
-                    report_lines.append(f"*📋 数据来源：{result.data_sources}*")
+                self._append_data_sources_line(report_lines, result, labels)
 
                 # 错误信息（如果有）
                 if not result.success and result.error_message:
@@ -1303,6 +1404,11 @@ class NotificationService(
                     f"{labels['score_label']} {r.sentiment_score} | "
                     f"{localize_trend_prediction(r.trend_prediction, report_language)}"
                 )
+                if self._report_summary_only:
+                    news_disclosure = self._empty_news_disclosure(r, report_language)
+                    if news_disclosure:
+                        report_lines.append(news_disclosure)
+                    self._append_data_sources_line(report_lines, r, labels)
             report_lines.extend([
                 "",
                 "---",
@@ -1559,12 +1665,17 @@ class NotificationService(
                             report_lines.append(f"**{volume_analysis_label}**: {result.volume_analysis}")
                         report_lines.append("")
                     # 消息面
-                    if result.news_summary:
-                        report_lines.extend([
-                            f"### 📰 {news_heading}",
-                            f"{result.news_summary}",
-                            "",
-                        ])
+                    news_disclosure = self._empty_news_disclosure(result, report_language)
+                    if result.news_summary or news_disclosure:
+                        report_lines.append(f"### 📰 {news_heading}")
+                        if news_disclosure:
+                            report_lines.append(news_disclosure)
+                        if result.news_summary:
+                            report_lines.append(f"{result.news_summary}")
+                        report_lines.append("")
+
+                if self._append_data_sources_line(report_lines, result, labels):
+                    report_lines.append("")
 
                 report_lines.extend([
                     "---",
@@ -1637,6 +1748,9 @@ class NotificationService(
                     f"{labels['score_label']} {r.sentiment_score} | "
                     f"{localize_trend_prediction(r.trend_prediction, report_language)}"
                 )
+                news_disclosure = self._empty_news_disclosure(r, report_language)
+                if news_disclosure:
+                    lines.append(news_disclosure)
         else:
             for result in sorted_results:
                 signal_text, signal_emoji, _ = self._get_signal_level(result)
@@ -1659,6 +1773,11 @@ class NotificationService(
                     lines.append("")
                 # 重要信息区（舆情+基本面）
                 info_lines = []
+
+                # 新闻零命中时必须披露，否则企业微信这一路会静默省略
+                news_disclosure = self._empty_news_disclosure(result, report_language)
+                if news_disclosure:
+                    info_lines.append(news_disclosure)
 
                 # 业绩预期
                 if intel.get('earnings_outlook'):
@@ -1809,6 +1928,9 @@ class NotificationService(
                 f"{labels['score_label']}:{result.sentiment_score} | "
                 f"{localize_trend_prediction(result.trend_prediction, report_language)}"
             )
+            news_disclosure = self._empty_news_disclosure(result, report_language)
+            if news_disclosure:
+                lines.append(news_disclosure)
 
             # 操作理由（截断）
             if hasattr(result, 'buy_reason') and result.buy_reason:
@@ -1894,6 +2016,11 @@ class NotificationService(
                 f"{signal_text} | "
                 f"{labels['score_label']} {r.sentiment_score} | {one}"
             )
+            news_disclosure = self._empty_news_disclosure(r, report_language)
+            if news_disclosure:
+                lines.append(news_disclosure)
+            if self._append_data_sources_line(lines, r, labels):
+                lines.append("")
         lines.append("")
         lines.append(f"*{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
         models = self._collect_models_used(results)
@@ -1950,6 +2077,12 @@ class NotificationService(
 
         # 重要信息（舆情+基本面）
         info_added = False
+        news_disclosure = self._empty_news_disclosure(result, report_language)
+        if news_disclosure:
+            lines.append(f"### 📰 {labels['info_heading']}")
+            lines.append("")
+            lines.append(news_disclosure)
+            info_added = True
         if intel:
             if intel.get('earnings_outlook'):
                 if not info_added:
@@ -2076,7 +2209,7 @@ class NotificationService(
         mapping = self._SOURCE_DISPLAY_NAMES.get(raw_source)
         if not mapping:
             return raw_source
-        return mapping[normalize_report_language(language)]
+        return mapping.get(normalize_report_language(language), mapping.get("en", raw_source))
 
     def _append_market_snapshot(self, lines: List[str], result: AnalysisResult) -> None:
         snapshot = getattr(result, 'market_snapshot', None)
@@ -2134,9 +2267,10 @@ class NotificationService(
         sign = "-" if amount < 0 else ""
         abs_amount = abs(amount)
         suffix = cls._CURRENCY_SUFFIX.get((currency or "").upper(), "元")
-        if abs_amount >= 1e8:
+        # Compare the rounded figure too, so 99_999_999 reads 1.00 亿 rather than 10000.00 万.
+        if abs_amount >= 1e8 or round(abs_amount / 1e4, 2) >= 1e4:
             return f"{sign}{abs_amount / 1e8:.2f} 亿{suffix}"
-        if abs_amount >= 1e4:
+        if abs_amount >= 1e4 or round(abs_amount) >= 1e4:
             return f"{sign}{abs_amount / 1e4:.2f} 万{suffix}"
         return f"{sign}{abs_amount:.0f} {suffix}"
 
@@ -2334,7 +2468,9 @@ class NotificationService(
     def _format_net_shares(cls, value: Any) -> str:
         """Format an institutional net buy/sell in 万股/亿股, signed (+ = net buy).
 
-        Thresholds: abs >= 1e8 -> 亿股, >= 1e4 -> 万股, else 股. None/NaN/non-numeric -> N/A.
+        Thresholds: abs >= 1e8 -> 亿股, >= 1e4 -> 万股, else 股. A value whose rounded
+        figure reaches the next unit also moves up (99_999_999 -> 1.00 亿股, 9_999.6 ->
+        1.00 万股). None/NaN/non-numeric -> N/A.
         """
         try:
             amount = float(value)
@@ -2344,9 +2480,10 @@ class NotificationService(
             return "N/A"
         sign = "+" if amount > 0 else ("-" if amount < 0 else "")
         a = abs(amount)
-        if a >= 1e8:
+        # Compare the rounded figure too, so 99_999_999 reads 1.00 亿股 rather than 10000.00 万股.
+        if a >= 1e8 or round(a / 1e4, 2) >= 1e4:
             return f"{sign}{a / 1e8:.2f} 亿股"
-        if a >= 1e4:
+        if a >= 1e4 or round(a) >= 1e4:
             return f"{sign}{a / 1e4:.2f} 万股"
         return f"{sign}{a:.0f} 股"
 

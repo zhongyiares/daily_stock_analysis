@@ -25,13 +25,15 @@ import os
 import random
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from datetime import datetime
+from threading import Event
 from typing import Optional, Dict, Any, List, Tuple
 
 import pandas as pd
 import requests  # 引入 requests 以捕获异常
+from src.core.stock_execution_context import stock_child_thread_pool
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -53,6 +55,7 @@ except (ValueError, TypeError):
 
 from src.patches.eastmoney_patch import eastmoney_patch
 from src.config import get_config
+from src.services.stock_list_parser import ParseStatus, parse_analysis_target
 from .base import (
     BaseFetcher,
     DataFetchError,
@@ -204,10 +207,14 @@ def _ef_call_with_timeout(func, *args, timeout=None, **kwargs):
         timeout = _EF_CALL_TIMEOUT
     # Do NOT use 'with ThreadPoolExecutor(...)' here: the context manager calls
     # shutdown(wait=True) on __exit__, which would re-block on the hung thread.
-    executor = ThreadPoolExecutor(max_workers=1)
+    abandoned = Event()
+    executor = stock_child_thread_pool(1, "efinance", abandon_workers_when=abandoned)
     try:
         future = executor.submit(func, *args, **kwargs)
         return future.result(timeout=timeout)
+    except FuturesTimeoutError:
+        abandoned.set()
+        raise
     finally:
         # wait=False: calling thread returns immediately; worker cleans up later
         executor.shutdown(wait=False)
@@ -470,7 +477,7 @@ class EfinanceFetcher(BaseFetcher):
                 logger.warning(failure_message)
                 raise RateLimitError(f"efinance 可能被限流: {failure_message}") from e
 
-            logger.error(failure_message)
+            logger.warning(failure_message)
             raise DataFetchError(f"efinance 获取数据失败: {failure_message}") from e
     
     def _fetch_etf_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -564,7 +571,7 @@ class EfinanceFetcher(BaseFetcher):
                 logger.warning(failure_message)
                 raise RateLimitError(f"efinance 可能被限流: {failure_message}") from e
 
-            logger.error(failure_message)
+            logger.warning(failure_message)
             raise DataFetchError(f"efinance 获取 ETF 数据失败: {failure_message}") from e
     
     def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
@@ -626,6 +633,7 @@ class EfinanceFetcher(BaseFetcher):
         
         数据来源：ef.stock.get_realtime_quotes()
         ETF 数据源：ef.stock.get_realtime_quotes(['ETF'])
+        已登记指数：东财单股 secid 接口（get_index_realtime_quote）
         
         Args:
             stock_code: 股票代码
@@ -633,6 +641,11 @@ class EfinanceFetcher(BaseFetcher):
         Returns:
             UnifiedRealtimeQuote 对象，获取失败返回 None
         """
+        # 已登记指数走东财单股 secid 接口（Story 1.5）
+        target = parse_analysis_target(stock_code)
+        if target.asset_type == ParseStatus.INDEX:
+            return self.get_index_realtime_quote(target.canonical_id)
+
         # ETF 需要单独请求 ETF 实时行情接口
         if _is_etf_code(stock_code):
             return self._get_etf_realtime_quote(stock_code)
@@ -736,6 +749,87 @@ class EfinanceFetcher(BaseFetcher):
             return None
         except Exception as e:
             logger.info(f"[API错误] 获取 {stock_code} 实时行情(efinance)失败: {e}")
+            circuit_breaker.record_failure(source_key, str(e))
+            return None
+
+    def get_index_realtime_quote(
+        self, stock_code: str
+    ) -> Optional[UnifiedRealtimeQuote]:
+        """Fetch a registered CN index quote via the Eastmoney single-stock secid API.
+
+        Supports SH (``1.{code}``), SZ (``0.{code}``) and CSI (``2.{code}``)
+        secid forms. This is the only realtime source for CSI indices and the
+        fallback for SH/SZ indices when Tencent/Sina fail (Story 1.5).
+        """
+        target = parse_analysis_target(stock_code)
+        if target.asset_type != ParseStatus.INDEX or target.matched_index is None:
+            return None
+        entry = target.matched_index
+        exchange = entry.exchange.upper()
+        if exchange == "SH":
+            secid = f"1.{entry.bare_code}"
+        elif exchange == "SZ":
+            secid = f"0.{entry.bare_code}"
+        elif exchange == "CSI":
+            secid = f"2.{entry.bare_code}"
+        else:
+            return None
+
+        circuit_breaker = get_realtime_circuit_breaker()
+        source_key = "efinance_index"
+        if not circuit_breaker.is_available(source_key):
+            logger.info(f"[熔断] 数据源 {source_key} 处于熔断状态，跳过")
+            return None
+
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            response = requests.get(
+                "https://push2.eastmoney.com/api/qt/stock/get",
+                params={
+                    "secid": secid,
+                    "fltt": "2",
+                    "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f60,f168,f169,f170,f171",
+                },
+                timeout=10,
+            )
+            if response.status_code != 200:
+                circuit_breaker.record_failure(source_key, f"HTTP {response.status_code}")
+                return None
+            payload = response.json()
+            data = payload.get("data") or {}
+            price = safe_float(data.get("f43"))
+            if price is None or price <= 0:
+                circuit_breaker.record_failure(source_key, "empty quote payload")
+                return None
+            circuit_breaker.record_success(source_key)
+            quote = UnifiedRealtimeQuote(
+                code=target.canonical_id,
+                name=str(data.get("f58") or entry.display_name or ""),
+                source=RealtimeSource.EFINANCE,
+                price=price,
+                change_pct=safe_float(data.get("f170")),
+                change_amount=safe_float(data.get("f169")),
+                volume=safe_int(data.get("f47")),
+                amount=safe_float(data.get("f48")),
+                amplitude=safe_float(data.get("f171")),
+                high=safe_float(data.get("f44")),
+                low=safe_float(data.get("f45")),
+                open_price=safe_float(data.get("f46")),
+                pre_close=safe_float(data.get("f60")),
+                volume_ratio=safe_float(data.get("f168")),
+            )
+            logger.info(
+                "[实时行情-东财指数] %s %s: 价格=%s, 涨跌=%s%%, secid=%s",
+                target.canonical_id,
+                quote.name,
+                quote.price,
+                quote.change_pct,
+                secid,
+            )
+            return quote
+        except Exception as e:
+            logger.info(f"[API错误] 获取 {target.canonical_id} 指数实时行情(东财)失败: {e}")
             circuit_breaker.record_failure(source_key, str(e))
             return None
 
@@ -918,7 +1012,7 @@ class EfinanceFetcher(BaseFetcher):
             logger.error(f"[efinance] 获取指数行情失败: {e}")
             return None
 
-    def get_market_stats(self) -> Optional[Dict[str, Any]]:
+    def get_market_stats(self, *, allow_cache: bool = True) -> Optional[Dict[str, Any]]:
         """
         获取市场涨跌统计 (efinance)
         """
@@ -930,7 +1024,7 @@ class EfinanceFetcher(BaseFetcher):
 
             current_time = time.time()
             if (
-                _realtime_cache['data'] is not None and
+                allow_cache and _realtime_cache['data'] is not None and
                 current_time - _realtime_cache['timestamp'] < _realtime_cache['ttl']
             ):
                 df = _realtime_cache['data']

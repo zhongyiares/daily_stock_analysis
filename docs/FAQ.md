@@ -103,8 +103,9 @@
    - WebUI 保存后会触发当前进程的配置重载；运行中的读取路径会同步使用最新写回的 `.env`，例如定时任务会继续热读取保存后的 `STOCK_LIST`
    - 如果容器启动命令里传入了这些同名环境变量（如 `--env-file .env`、`docker run -e ...` 或 Compose `environment:`），后续重启时仍可能以启动环境变量为准；要让 WebUI 保存值接管，请同步更新或移除这些同名 override
    - 如需持久化 WebUI 保存的配置，请将 `ENV_FILE` 指向 `/app/data/runtime.env` 等可写数据卷文件，不要把宿主机 `.env` 单文件挂载到 `/app/.env`
-   - `SCHEDULE_ENABLED`、`SCHEDULE_TIME`、`SCHEDULE_TIMES` 保存后会让 WebUI/API/Desktop 长运行进程按新配置启停或重建 runtime scheduler
+   - `SCHEDULE_ENABLED`、`SCHEDULE_TIME`、`SCHEDULE_TIMES` 保存后会让 WebUI/API/Desktop 长运行进程按新配置启停或重建 runtime scheduler；重启 `--serve-only` 或 Desktop 进程时会恢复已启用的 daily jobs，但不会在启动时立即执行分析
    - `SCHEDULE_RUN_IMMEDIATELY` 与 `RUN_IMMEDIATELY` 仍属于启动期/一次性运行配置，保存后不会立即触发一次分析
+   - `SCHEDULE_STARTUP_DEDUP` 控制纯 CLI 定时模式启动立即执行的当日去重（当天已有成功全量分析则跳过启动补跑；详见 `docs/full-guide.md` 配置表），同样属于启动期配置
 3. **Docker 手工改 `.env` 后**：修改后仍建议重启容器
    ```bash
    docker-compose down && docker-compose up -d
@@ -284,7 +285,7 @@ OPENAI_MODEL=deepseek-v4-flash
    - 若 Ollama 和程序不在同一主机，需将 `OLLAMA_API_BASE` 改为实际 IP，如 `http://192.168.1.100:11434`。
    - 确认防火墙已放行 11434 端口，且 Ollama 启动时绑定了正确地址（`OLLAMA_HOST=0.0.0.0:11434`）。
 
-> 完整配置示例见 [LLM 配置指南 → 示例 4（Ollama）](LLM_CONFIG_GUIDE.md#example-4-ollama)。
+> 完整配置示例见 [LLM 配置指南 → 示例 4（Ollama）](LLM_CONFIG_GUIDE.md#示例-4使用-ollama-本地模型)。
 
 ---
 
@@ -420,6 +421,20 @@ python main.py --market-only
 - `TRADING_DAY_CHECK_ENABLED=true` 且 `force_run=false`：非交易日跳过（默认）
 - `force_run=true`：本次即使非交易日也执行
 - `TRADING_DAY_CHECK_ENABLED=false`：定时和手动都不做交易日检查
+
+---
+
+### Q19: Fork 仓库后 GitHub Actions 为什么没有按时自动运行？如何同步更新与自检？
+
+**常见原因**：
+1. GitHub 对 Fork 仓库默认禁用定时 Workflows，需要进入 Fork 的 `Actions` 标签手动点击启用。
+2. GitHub 平台规定若仓库连续 **60 天无仓库活动**，会自动暂停 `schedule` 定时任务。
+3. 未同步上游仓库的最新修复，或本地修改了 `.github/workflows/*.yml` 导致 `Sync fork` 冲突。
+
+**解决方案**：
+1. 在你 Fork 的仓库首页点击 `Sync fork` → `Update branch` 同步最新代码（建议不要直接修改 workflow 文件，所有配置通过 `Settings → Secrets and variables → Actions` 传递）。
+2. 如已被 GitHub 自动暂停定时任务，进入 `Actions → 每日股票分析` 点击 `Enable workflow` 重新开启。
+3. 本地运行可使用 `python main.py --doctor` 一键输出脱敏配置/模型/通知/存储诊断信息，快速定位异常。
 
 ---
 

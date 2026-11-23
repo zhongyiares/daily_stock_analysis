@@ -50,8 +50,14 @@ def build_decision_signal_payload_from_report(
     query_source: str,
     report_type: str,
     profile_source: ProfileSource,
+    market_override: Optional[str] = None,
 ) -> Dict[str, Any] | None:
-    """Build a DecisionSignal payload from a completed stock analysis report."""
+    """Build a DecisionSignal payload from a completed stock analysis report.
+
+    ``market_override`` lets callers supply a target-derived market (e.g.
+    ``cn`` for index targets whose canonical code would otherwise resolve to
+    ``None`` via ``get_market_for_stock``).
+    """
 
     if result is None or not getattr(result, "success", True):
         return None
@@ -72,7 +78,7 @@ def build_decision_signal_payload_from_report(
         return None
 
     raw_code = str(getattr(result, "code", "") or "").strip()
-    market = get_market_for_stock(normalize_stock_code(raw_code))
+    market = market_override or get_market_for_stock(normalize_stock_code(raw_code))
     if not market:
         logger.warning("Skip decision signal extraction: unrecognized market stock_code=%s", raw_code)
         return None
@@ -209,6 +215,7 @@ def extract_and_persist_from_analysis_result(
     report_type: str,
     profile_source: ProfileSource,
     service: Optional[DecisionSignalService] = None,
+    market_override: Optional[str] = None,
 ) -> Dict[str, Any] | None:
     """Best-effort extract and persist a DecisionSignal from an analysis result."""
 
@@ -222,6 +229,7 @@ def extract_and_persist_from_analysis_result(
             query_source=query_source,
             report_type=report_type,
             profile_source=profile_source,
+            market_override=market_override,
         )
         if payload is None:
             return None
@@ -453,14 +461,25 @@ def _extract_holding_state(portfolio_context: Optional[Mapping[str, Any]]) -> st
 
 
 def _risk_summary(result: AnalysisResult, dashboard: Mapping[str, Any]) -> Optional[Any]:
-    risks = []
-    risk_warning = getattr(result, "risk_warning", None)
-    if risk_warning:
-        risks.append(str(risk_warning))
+    def risk_key(text: str) -> str:
+        return text.strip().rstrip("。.!！").rstrip()
+
+    risks: list[str] = []
+    seen: set[str] = set()
+    items = [getattr(result, "risk_warning", None)]
     intelligence = _as_mapping(dashboard.get("intelligence"))
     risk_alerts = intelligence.get("risk_alerts")
     if isinstance(risk_alerts, list):
-        risks.extend(str(item) for item in risk_alerts if str(item or "").strip())
+        items.extend(risk_alerts)
+    for item in items:
+        text = str(item or "").strip()
+        if not text or risk_key(text) in seen:
+            continue
+        risks.append(text)
+        seen.add(risk_key(text))
+        # Skip exact copies of separately listed clauses, such as the price
+        # sanity alert prepended to risk_warning with a semicolon.
+        seen.update(risk_key(clause) for clause in text.replace("；", ";").split(";"))
     return risks[:5] or None
 
 

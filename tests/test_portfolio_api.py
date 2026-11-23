@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -24,7 +25,7 @@ except ModuleNotFoundError:
 import src.auth as auth
 from api.app import create_app
 from src.config import Config
-from src.services.portfolio_service import PortfolioBusyError
+from src.services.portfolio_service import PortfolioBusyError, PortfolioService
 from src.storage import DatabaseManager
 
 
@@ -124,6 +125,57 @@ class PortfolioApiTestCase(unittest.TestCase):
         self._save_close(symbol, date(2026, 1, 3), 110.0)
         return account_id
 
+    def test_event_api_rejects_non_finite_numbers_without_writes(self) -> None:
+        aid = self._create_position()
+        cases = [
+            ("trades", {"symbol": "600519", "trade_date": "2026-01-02",
+                        "side": "buy", "quantity": 10, "price": 100},
+             ("quantity", "price", "fee", "tax")),
+            ("cash-ledger", {"event_date": "2026-01-02", "direction": "in", "amount": 1000},
+             ("amount",)),
+            ("corporate-actions", {"symbol": "600519", "effective_date": "2026-01-02",
+                                   "action_type": "cash_dividend", "cash_dividend_per_share": 0},
+             ("cash_dividend_per_share", "split_ratio")),
+            ("corporate-actions", {"symbol": "600519", "effective_date": "2026-01-02",
+                                   "action_type": "split_adjustment", "split_ratio": 2},
+             ("split_ratio", "cash_dividend_per_share")),
+        ]
+        for endpoint, payload, fields in cases:
+            url = f"/api/v1/portfolio/{endpoint}"
+            before = self.client.get(url, params={"account_id": aid}).json()["total"]
+            for field in fields:
+                # Include valid JSON numbers whose float conversion overflows,
+                # as well as string inputs accepted by Pydantic's float coercion.
+                for token in ('"Infinity"', '"-Infinity"', '"NaN"', '"1e309"', '1e309', '-1e309', 'NaN'):
+                    with self.subTest(endpoint=endpoint, field=field, token=token):
+                        body = json.dumps({"account_id": aid, **payload, field: "NONFINITE"})
+                        body = body.replace('"NONFINITE"', token)
+                        resp = self.client.post(url, content=body, headers={"Content-Type": "application/json"})
+                        self.assertEqual(resp.status_code, 422, resp.text)
+                        error = resp.json()
+                        self.assertEqual(error["error"], "validation_error")
+                        self.assertEqual(error["detail"][0]["loc"], ["body", field])
+                        self.assertEqual(error["detail"][0]["type"], "finite_number")
+                        json.dumps(error, allow_nan=False)
+            self.assertEqual(self.client.get(url, params={"account_id": aid}).json()["total"], before)
+        snapshot = self.client.get("/api/v1/portfolio/snapshot", params={
+            "account_id": aid, "as_of": "2026-01-03", "include_realtime": False,
+        })
+        self.assertEqual(snapshot.status_code, 200, snapshot.text)
+        self.assertEqual(snapshot.json()["accounts"][0]["positions"][0]["quantity"], 10)
+        self.assertIsNotNone(snapshot.json()["total_equity"])
+
+    def test_validation_error_serializes_nested_non_finite_input(self) -> None:
+        body = ('{"account_id": 1, "symbol": "600519", "trade_date": "2026-01-02", '
+                '"side": {"nested": [1e309]}, "quantity": 10, "price": -1.5}')
+        resp = self.client.post("/api/v1/portfolio/trades", content=body,
+                                headers={"Content-Type": "application/json"})
+        self.assertEqual(resp.status_code, 422, resp.text)
+        errors = {item["loc"][-1]: item for item in resp.json()["detail"]}
+        self.assertEqual(errors["side"]["input"], {"nested": ["inf"]})
+        self.assertEqual(errors["price"]["input"], -1.5)
+        json.dumps(resp.json(), allow_nan=False)
+
     def test_account_event_snapshot_flow(self) -> None:
         create_resp = self.client.post(
             "/api/v1/portfolio/accounts",
@@ -178,6 +230,43 @@ class PortfolioApiTestCase(unittest.TestCase):
         self.assertAlmostEqual(account_snapshot["total_cash"], 0.0, places=6)
         self.assertAlmostEqual(account_snapshot["total_market_value"], 11000.0, places=6)
         self.assertAlmostEqual(account_snapshot["total_equity"], 11000.0, places=6)
+
+    def test_snapshot_exposes_per_account_values_in_aggregate_currency(self) -> None:
+        cn_id = self._create_position(name="CNY Account", quantity=1)
+        us_id = self._create_position(name="USD Account", symbol="AAPL", quantity=1, market="us", currency="USD")
+        self._save_close("600519", date(2026, 1, 3), 70)
+        self._save_close("AAPL", date(2026, 1, 3), 100)
+        service = PortfolioService()
+
+        for stale in (False, True):
+            with self.subTest(fx_stale=stale):
+                service.repo.save_fx_rate(
+                    from_currency="USD", to_currency="CNY", rate_date=date(2026, 1, 3),
+                    rate=7, source="manual", is_stale=stale,
+                )
+                response = self.client.get(
+                    "/api/v1/portfolio/snapshot",
+                    params={"as_of": "2026-01-03", "include_realtime": False},
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                snapshot = response.json()
+                accounts = {item["account_id"]: item for item in snapshot["accounts"]}
+                self.assertEqual(snapshot["currency"], "CNY")
+                self.assertEqual(snapshot["total_market_value"], 770)
+                self.assertEqual(snapshot["fx_stale"], stale)
+                self.assertEqual(accounts[cn_id]["total_market_value_aggregate"], 70)
+                self.assertEqual(accounts[us_id]["total_market_value_aggregate"], 700)
+                self.assertEqual(accounts[us_id]["total_market_value"], 100)
+                self.assertEqual(accounts[us_id]["positions"][0]["market_value_base"], 100)
+
+                response = self.client.get(
+                    "/api/v1/portfolio/snapshot",
+                    params={"account_id": us_id, "as_of": "2026-01-03", "include_realtime": False},
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                selected = response.json()
+                self.assertEqual(selected["total_market_value"], 700)
+                self.assertEqual(selected["accounts"][0]["total_market_value_aggregate"], 700)
 
     def test_snapshot_include_realtime_false_skips_realtime_quote(self) -> None:
         today = date.today()
